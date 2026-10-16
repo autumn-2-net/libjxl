@@ -118,6 +118,14 @@ bool SetupFrame(JxlEncoder* enc, JxlEncoderFrameSettings* settings,
           return false;
         }
       }
+      JxlBlendInfo extra_channel_blend_info = frame_header.layer_info.blend_info;
+      extra_channel_blend_info.clamp = JXL_FALSE;
+      if (JXL_ENC_SUCCESS != JxlEncoderSetExtraChannelBlendInfo(
+                                 settings, num_interleaved_alpha + i,
+                                 &extra_channel_blend_info)) {
+        fprintf(stderr, "JxlEncoderSetExtraChannelBlendInfo() failed.\n");
+        return false;
+      }
     }
   }
   return true;
