@@ -7,9 +7,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <queue>
 #include <utility>
@@ -148,9 +151,15 @@ Status GatherTreeData(const Image &image, pixel_type chan, size_t group_id,
   const bool multiple_predictors = tree_samples.NumPredictors() != 1;
   auto compute_sample = [&](const pixel_type *p, size_t x, size_t y) {
     pixel_type_w pred[kNumModularPredictors];
-    if (multiple_predictors) {
+    const bool sampled = use_sample();
+    if (multiple_predictors && (sampled || !options.lossless_tree_speedups)) {
       PredictLearnAll(&properties, channel.w, p + x, onerow, x, y, references,
                       &wp_state, pred);
+    } else if (multiple_predictors) {
+      // Keep WP and the previous-gradient property in exactly the same state,
+      // but do not compute fourteen predictions for a discarded sample.
+      PredictLearn(&properties, channel.w, p + x, onerow, x, y,
+                   Predictor::Zero, references, &wp_state);
     } else {
       pred[static_cast<int>(tree_samples.PredictorFromIndex(0))] =
           PredictLearn(&properties, channel.w, p + x, onerow, x, y,
@@ -159,7 +168,7 @@ Status GatherTreeData(const Image &image, pixel_type chan, size_t group_id,
               .guess;
     }
     (*total_pixels)++;
-    if (use_sample()) {
+    if (sampled) {
       tree_samples.AddSample(p[x], properties, pred);
     }
     wp_state.UpdateErrors(p[x], x, y, channel.w);
@@ -178,9 +187,13 @@ Status GatherTreeData(const Image &image, pixel_type chan, size_t group_id,
       }
       for (size_t x = 2; x < channel.w - 2; x++) {
         pixel_type_w pred[kNumModularPredictors];
-        if (multiple_predictors) {
+        const bool sampled = use_sample();
+        if (multiple_predictors && (sampled || !options.lossless_tree_speedups)) {
           PredictLearnAllNEC(&properties, channel.w, p + x, onerow, x, y,
                              references, &wp_state, pred);
+        } else if (multiple_predictors) {
+          PredictLearnNEC(&properties, channel.w, p + x, onerow, x, y,
+                          Predictor::Zero, references, &wp_state);
         } else {
           pred[static_cast<int>(tree_samples.PredictorFromIndex(0))] =
               PredictLearnNEC(&properties, channel.w, p + x, onerow, x, y,
@@ -189,7 +202,7 @@ Status GatherTreeData(const Image &image, pixel_type chan, size_t group_id,
                   .guess;
         }
         (*total_pixels)++;
-        if (use_sample()) {
+        if (sampled) {
           tree_samples.AddSample(p[x], properties, pred);
         }
         wp_state.UpdateErrors(p[x], x, y, channel.w);
@@ -571,7 +584,14 @@ StatusOr<Tree> LearnTree(
     const Image *images, const ModularOptions *options, const uint32_t start,
     const uint32_t stop,
     const std::vector<ModularMultiplierInfo> &multiplier_info = {}) {
-  TreeSamples tree_samples;
+  const char* trace_env = std::getenv("JXL_LOSSLESS_SEARCH_TRACE");
+  const bool trace = options[start].lossless_tree_speedups &&
+                     images[start].w * images[start].h >= 65536 && trace_env &&
+                     std::strcmp(trace_env, "1") == 0;
+  using Clock = std::chrono::steady_clock;
+  const auto before_prepare = trace ? Clock::now() : Clock::time_point{};
+  TreeSamples tree_samples(options[start].lossless_tree_speedups,
+                            options[start].lossless_fast_entropy);
   JXL_RETURN_IF_ERROR(tree_samples.SetPredictor(options[start].predictor,
                                                 options[start].wp_tree_mode));
   JXL_RETURN_IF_ERROR(
@@ -594,6 +614,7 @@ StatusOr<Tree> LearnTree(
   tree_samples.PreQuantizeProperties(
       range, multiplier_info, group_pixel_count, channel_pixel_count,
       pixel_samples, diff_samples, options[start].max_property_values);
+  const auto before_gather = trace ? Clock::now() : Clock::time_point{};
 
   size_t total_pixels = 0;
   for (size_t i = 0; i < images[start].channel.size(); i++) {
@@ -641,10 +662,22 @@ StatusOr<Tree> LearnTree(
     }
   }
 
+  const auto before_split = trace ? Clock::now() : Clock::time_point{};
+  const size_t samples = tree_samples.NumDistinctSamples();
   // TODO(veluca): parallelize more.
   JXL_ASSIGN_OR_RETURN(Tree tree,
                        LearnTree(std::move(tree_samples), total_pixels,
                                  options[start], multiplier_info, range));
+  if (trace) {
+    std::fprintf(stderr,
+                 "lossless-learn samples=%" PRIuS " nodes=%" PRIuS
+                 " prepare_s=%.6f gather_s=%.6f split_s=%.6f\n",
+                 samples, tree.size(),
+                 std::chrono::duration<double>(before_gather - before_prepare).count(),
+                 std::chrono::duration<double>(before_split - before_gather).count(),
+                 std::chrono::duration<double>(Clock::now() - before_split).count());
+    std::fflush(stderr);
+  }
   return tree;
 }
 
@@ -719,6 +752,13 @@ Status ModularGenericCompress(const Image &image, const ModularOptions &opts,
     return true;  // is there any use for a zero-channel image?
   if (image.error) return JXL_FAILURE("Invalid image");
 
+  const char* trace_value = std::getenv("JXL_LOSSLESS_SEARCH_TRACE");
+  const bool trace = opts.lossless_tree_speedups &&
+                     uint64_t{image.w} * image.h >= 65536 && trace_value &&
+                     std::strcmp(trace_value, "1") == 0;
+  using Clock = std::chrono::steady_clock;
+  const auto start = trace ? Clock::now() : Clock::time_point{};
+
   ModularOptions options = opts;  // Make a copy to modify it.
   if (options.predictor == kUndefinedPredictor) {
     options.predictor = Predictor::Gradient;
@@ -761,6 +801,7 @@ Status ModularGenericCompress(const Image &image, const ModularOptions &opts,
                           options.max_properties);
   }
 
+  const auto after_tree = trace ? Clock::now() : Clock::time_point{};
   Tree decoded_tree;
   std::vector<std::vector<Token>> tree_tokens(1);
   JXL_RETURN_IF_ERROR(TokenizeTree(tree, tree_tokens.data(), &decoded_tree));
@@ -788,6 +829,7 @@ Status ModularGenericCompress(const Image &image, const ModularOptions &opts,
   // further
   JXL_RETURN_IF_ERROR(ModularCompress(image, options, group_id, tree, header,
                                       tokens[0], &image_width));
+  const auto after_tokens = trace ? Clock::now() : Clock::time_point{};
 
   // Write data
   code = {};
@@ -799,6 +841,17 @@ Status ModularGenericCompress(const Image &image, const ModularOptions &opts,
                                      &writer, layer, aux_out));
   (void)cost;
   JXL_RETURN_IF_ERROR(WriteTokens(tokens[0], code, 0, &writer, layer, aux_out));
+
+  if (trace) {
+    std::fprintf(stderr,
+                 "lossless-local group=%" PRIuS " width=%" PRIuS
+                 " height=%" PRIuS " tree_s=%.6f tokens_s=%.6f entropy_s=%.6f\n",
+                 group_id, image.w, image.h,
+                 std::chrono::duration<double>(after_tree - start).count(),
+                 std::chrono::duration<double>(after_tokens - after_tree).count(),
+                 std::chrono::duration<double>(Clock::now() - after_tokens).count());
+    std::fflush(stderr);
+  }
 
   bits = writer.BitsWritten() - bits;
   JXL_DEBUG_V(4,

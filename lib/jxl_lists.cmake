@@ -352,6 +352,10 @@ set(JPEGXL_INTERNAL_ENC_SOURCES
   jxl/enc_image_bundle.h
   jxl/enc_linalg.cc
   jxl/enc_linalg.h
+  jxl/enc_lossless_probe.cc
+  jxl/enc_lossless_probe.h
+  jxl/enc_lossless_search.cc
+  jxl/enc_lossless_search.h
   jxl/enc_lz77.cc
   jxl/enc_lz77.h
   jxl/enc_modular.cc

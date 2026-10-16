@@ -45,6 +45,7 @@
 #include "lib/jxl/enc_fields.h"
 #include "lib/jxl/enc_frame.h"
 #include "lib/jxl/enc_icc_codec.h"
+#include "lib/jxl/enc_lossless_search.h"
 #include "lib/jxl/enc_params.h"
 #include "lib/jxl/encode_internal.h"
 #include "lib/jxl/frame_header.h"
@@ -2000,6 +2001,7 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
       } else {
         frame_settings->values.cparams.palette_colors = value;
       }
+      frame_settings->values.cparams.palette_colors_is_default = (value == -1);
       break;
     case JXL_ENC_FRAME_SETTING_LOSSY_PALETTE:
       // TODO(lode): the defaults of some palette settings depend on others.
@@ -2169,6 +2171,8 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetFloatOption(
       } else {
         frame_settings->values.cparams.options.nb_repeats = value * 0.01f;
       }
+      frame_settings->values.cparams.ma_tree_learning_percent_is_default =
+          (value == -1);
       return JxlErrorOrStatus::Success();
     case JXL_ENC_FRAME_SETTING_CHANNEL_COLORS_GLOBAL_PERCENT:
       if (value < -1.f || value > 100.f) {
@@ -2193,6 +2197,8 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetFloatOption(
       } else {
         frame_settings->values.cparams.channel_colors_percent = value;
       }
+      frame_settings->values.cparams.channel_colors_percent_is_default =
+          (value == -1);
       return JxlErrorOrStatus::Success();
     case JXL_ENC_FRAME_SETTING_EFFORT:
     case JXL_ENC_FRAME_SETTING_DECODING_SPEED:
@@ -2531,6 +2537,12 @@ static bool CanDoFastLossless(const JxlEncoderFrameSettings* frame_settings,
                               const JxlPixelFormat* pixel_format,
                               bool has_alpha) {
   if (!frame_settings->values.lossless) {
+    return false;
+  }
+  if (!frame_settings->enc->metadata.m.bit_depth.floating_point_sample &&
+      frame_settings->enc->metadata.m.bit_depth.bits_per_sample <= 16 &&
+      jxl::HasLosslessSearchOptions(frame_settings->values.cparams)) {
+    // All cumulative levels must start from the same baseline, including e1.
     return false;
   }
   if (has_alpha && frame_settings->values.strip_alpha > 0) {

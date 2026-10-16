@@ -434,7 +434,9 @@ typedef enum {
   JXL_ENC_FRAME_SETTING_STRIP_ALPHA = 41,
   
   /** Enable or disable LF Smoothing for lossless JPEG recompression.
-   * -1 = default, 0 = disable smoothing, 1 = enable smoothing.
+   * -1 = default (disabled), 0 = disable smoothing, 1 = enable smoothing.
+   * Enabling smoothing requires an updated JPEG reconstruction decoder, such
+   * as libjxl 0.13. Older decoders can silently reconstruct a different JPEG.
    */
   JXL_ENC_FRAME_SETTING_JPEG_RECON_LFS = 42,
 

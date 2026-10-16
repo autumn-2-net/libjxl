@@ -6,7 +6,10 @@
 #include "lib/jxl/modular/encoding/enc_ma.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -18,6 +21,7 @@
 #include "lib/jxl/base/bits.h"
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/compiler_specific.h"
+#include "lib/jxl/base/printf_macros.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/dec_ans.h"
 #include "lib/jxl/modular/encoding/dec_ma.h"
@@ -77,6 +81,154 @@ float EstimateBits(const int32_t *counts, size_t num_symbols) {
     bits_lanes = Sub(bits_lanes, Mul(counts_fv, BitCast(df, nbps)));
   }
   return GetLane(SumOfLanes(df, bits_lanes));
+}
+
+constexpr uint32_t kEntropyTableMaxCount = 256;
+
+// Most tree nodes have few samples. Reuse the exact SIMD expression rather
+// than approximating entropy or changing its floating-point reduction order.
+const float* SmallHistogramEntropy(uint32_t total) {
+  if (total > kEntropyTableMaxCount) return nullptr;
+  static const std::vector<float> table = [] {
+    std::vector<float> values(
+        (kEntropyTableMaxCount + 1) * (kEntropyTableMaxCount + 2) / 2 + Lanes(df));
+    for (uint32_t n = 1; n <= kEntropyTableMaxCount; ++n) {
+      const auto total_v = Set(di, static_cast<int32_t>(n));
+      const auto inv_total = Set(df, 1.0f / n);
+      const auto minprob = Set(df, 1.0f / ANS_TAB_SIZE);
+      float* row = values.data() + n * (n + 1) / 2;
+      for (uint32_t i = 0; i <= n; i += Lanes(df)) {
+        const auto counts = Iota(di, static_cast<int32_t>(i));
+        const auto cf = ConvertTo(df, counts);
+        const auto nbps = IfThenZeroElse(
+            Eq(counts, total_v),
+            BitCast(di, FastLog2f(df, Max(Mul(cf, inv_total), minprob))));
+        // Tail lanes overlap the next row, which is initialized afterwards.
+        StoreU(Mul(cf, BitCast(df, nbps)), df, row + i);
+      }
+    }
+    return values;
+  }();
+  return table.data() + total * (total + 1) / 2;
+}
+
+template <bool kLookup>
+HWY_INLINE auto EntropyContribution(decltype(Zero(di)) counts,
+                                    decltype(Zero(di)) total,
+                                    decltype(Zero(df)) inverse,
+                                    const float* table) {
+  if (kLookup) return GatherIndex(df, table, counts);
+  const auto cf = ConvertTo(df, counts);
+  const auto nbps = IfThenZeroElse(
+      Eq(counts, total),
+      BitCast(di, FastLog2f(df, Max(Mul(cf, inverse),
+                                  Set(df, 1.0f / ANS_TAB_SIZE)))));
+  return Mul(cf, BitCast(df, nbps));
+}
+
+// The weighted sample totals depend only on the property split, not on the
+// predictor. Update both histograms and evaluate them in one pass, preserving
+// EstimateBits' floating-point operations and per-side lane accumulation order.
+template <bool kLookupAbove, bool kLookupBelow>
+void MoveCountsAndEstimateBitsImpl(
+    int32_t* above, int32_t* below, int32_t* increase, size_t num_symbols,
+    uint32_t total_above, uint32_t total_below, const float* table_above,
+    const float* table_below, float* bits_above, float* bits_below) {
+  JXL_DASSERT(num_symbols == Padded(num_symbols));
+  const auto total_r = Set(di, static_cast<int32_t>(total_above));
+  const auto total_l = Set(di, static_cast<int32_t>(total_below));
+  const auto inv_r = Set(df, 1.0f / GetLane(total_r));
+  const auto inv_l = Set(df, 1.0f / GetLane(total_l));
+  auto bits_r = Zero(df);
+  auto bits_l = Zero(df);
+  for (size_t i = 0; i < num_symbols; i += Lanes(di)) {
+    const auto delta = LoadU(di, increase + i);
+    const auto r = Sub(LoadU(di, above + i), delta);
+    const auto l = Add(LoadU(di, below + i), delta);
+    StoreU(r, di, above + i);
+    StoreU(l, di, below + i);
+    StoreU(Zero(di), di, increase + i);
+    bits_r = Sub(bits_r, EntropyContribution<kLookupAbove>(
+                             r, total_r, inv_r, table_above));
+    bits_l = Sub(bits_l, EntropyContribution<kLookupBelow>(
+                             l, total_l, inv_l, table_below));
+  }
+  *bits_above = GetLane(SumOfLanes(df, bits_r));
+  *bits_below = GetLane(SumOfLanes(df, bits_l));
+}
+
+void MoveCountsAndEstimateBits(int32_t* above, int32_t* below, int32_t* increase,
+                               size_t num_symbols, uint32_t total_above,
+                               uint32_t total_below, float* bits_above,
+                               float* bits_below) {
+  const float* table_above = SmallHistogramEntropy(total_above);
+  const float* table_below = SmallHistogramEntropy(total_below);
+  if (table_above && table_below) {
+    MoveCountsAndEstimateBitsImpl<true, true>(
+        above, below, increase, num_symbols, total_above, total_below,
+        table_above, table_below, bits_above, bits_below);
+  } else if (table_above) {
+    MoveCountsAndEstimateBitsImpl<true, false>(
+        above, below, increase, num_symbols, total_above, total_below,
+        table_above, table_below, bits_above, bits_below);
+  } else if (table_below) {
+    MoveCountsAndEstimateBitsImpl<false, true>(
+        above, below, increase, num_symbols, total_above, total_below,
+        table_above, table_below, bits_above, bits_below);
+  } else {
+    MoveCountsAndEstimateBitsImpl<false, false>(
+        above, below, increase, num_symbols, total_above, total_below,
+        nullptr, nullptr, bits_above, bits_below);
+  }
+}
+
+constexpr uint32_t kCountEntropyTableSize = 65536;
+
+const double* CountEntropyTable() {
+  static const std::vector<double> table = [] {
+    std::vector<double> values(kCountEntropyTableSize + 1);
+    for (uint32_t n = 1; n <= kCountEntropyTableSize; ++n) {
+      values[n] = n * std::log2(static_cast<double>(n));
+    }
+    return values;
+  }();
+  return table.data();
+}
+
+HWY_INLINE double CountEntropy(uint32_t count, const double* table) {
+  return count <= kCountEntropyTableSize
+             ? table[count]
+             : count * std::log2(static_cast<double>(count));
+}
+
+double HistogramCountEntropy(const int32_t* counts, size_t num_symbols,
+                              const double* table) {
+  double sum = 0;
+  for (size_t i = 0; i < num_symbols; ++i) sum += CountEntropy(counts[i], table);
+  return sum;
+}
+
+// H = N log2(N) - sum(c log2(c)). Moving one property value only changes bins
+// with a nonzero increment. Double accumulators limit cancellation drift.
+// This is a scoring heuristic, not the old min-probability-clipped estimate;
+// final candidate selection still compares complete encoded byte counts.
+void MoveCountsAndShannonBits(int32_t* above, int32_t* below, int32_t* increase,
+                              size_t num_symbols, uint32_t total_above,
+                              uint32_t total_below, const double* table,
+                              double* sum_above, double* sum_below,
+                              float* bits_above, float* bits_below) {
+  for (size_t i = 0; i < num_symbols; ++i) {
+    const int32_t delta = increase[i];
+    if (delta == 0) continue;
+    const int32_t r = above[i], l = below[i];
+    *sum_above += CountEntropy(r - delta, table) - CountEntropy(r, table);
+    *sum_below += CountEntropy(l + delta, table) - CountEntropy(l, table);
+    above[i] = r - delta;
+    below[i] = l + delta;
+    increase[i] = 0;
+  }
+  *bits_above = std::max(0.0, CountEntropy(total_above, table) - *sum_above);
+  *bits_below = std::max(0.0, CountEntropy(total_below, table) - *sum_below);
 }
 
 void MakeSplitNode(size_t pos, int property, int splitval, Predictor lpred,
@@ -168,6 +320,15 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
                    const std::vector<ModularMultiplierInfo> &mul_info,
                    StaticPropRange initial_static_prop_range,
                    float fast_decode_multiplier, Tree *tree) {
+  using Clock = std::chrono::steady_clock;
+  const char* trace_value = std::getenv("JXL_LOSSLESS_MA_TRACE");
+  const bool trace = tree_samples.LosslessSpeedups() &&
+                     tree_samples.NumDistinctSamples() >= 65536 &&
+                     trace_value && std::strcmp(trace_value, "1") == 0;
+  const auto start = trace ? Clock::now() : Clock::time_point{};
+  double histogram_seconds = 0, entropy_seconds = 0;
+  const double* entropy_table = tree_samples.FastEntropy() ? CountEntropyTable()
+                                                          : nullptr;
   struct NodeInfo {
     size_t pos;
     size_t begin;
@@ -180,6 +341,8 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
 
   size_t num_predictors = tree_samples.NumPredictors();
   size_t num_properties = tree_samples.NumProperties();
+  std::vector<int32_t> parent_counts(tree_samples.LosslessSpeedups() ? Padded(256)
+                                                                   : 0);
 
   // TODO(veluca): consider parallelizing the search (processing multiple nodes
   // at a time).
@@ -211,6 +374,34 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
     JXL_DASSERT(begin <= end);
     JXL_DASSERT(end <= tree_samples.NumDistinctSamples());
 
+    float base_bits = 0;
+    if (tree_samples.LosslessSpeedups()) {
+      // Leaf termination only needs the current predictor. Do not build all
+      // predictor histograms for a node that cannot be split anyway.
+      const size_t pred = tree_samples.PredictorIndex((*tree)[pos].predictor);
+      std::fill(parent_counts.begin(), parent_counts.end(), 0);
+      size_t parent_symbols = 0;
+      size_t parent_extra_bits = 0;
+      uint32_t parent_count = 0;
+      const auto& tokens = tree_samples.RTokens(pred);
+      for (size_t i = begin; i < end; ++i) {
+        const auto& token = tokens[i];
+        const size_t count = tree_samples.Count(i);
+        parent_counts[token.tok] += count;
+        parent_count += count;
+        parent_symbols = std::max(parent_symbols, size_t{token.tok} + 1);
+        parent_extra_bits += token.nbits * count;
+      }
+      base_bits = entropy_table
+                      ? std::max(0.0, CountEntropy(parent_count, entropy_table) -
+                                          HistogramCountEntropy(
+                                              parent_counts.data(), parent_symbols,
+                                              entropy_table))
+                      : EstimateBits(parent_counts.data(), Padded(parent_symbols));
+      base_bits += static_cast<uint32_t>(parent_extra_bits);
+      if (base_bits <= threshold && mul_info.empty()) continue;
+    }
+
     // Compute the maximum token in the range.
     size_t max_symbols = 0;
     for (size_t pred = 0; pred < num_predictors; pred++) {
@@ -222,21 +413,30 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
     max_symbols = Padded(max_symbols);
     std::vector<int32_t> counts(max_symbols * num_predictors);
     std::vector<uint32_t> tot_extra_bits(num_predictors);
+    uint32_t total_count = 0;
     for (size_t pred = 0; pred < num_predictors; pred++) {
       size_t extra_bits = 0;
       const std::vector<ResidualToken>& rtokens = tree_samples.RTokens(pred);
       for (size_t i = begin; i < end; i++) {
         const ResidualToken& rt = rtokens[i];
         size_t count = tree_samples.Count(i);
+        if (pred == 0 && tree_samples.LosslessSpeedups()) total_count += count;
         size_t eb = rt.nbits * count;
         counts[pred * max_symbols + rt.tok] += count;
         extra_bits += eb;
       }
       tot_extra_bits[pred] = extra_bits;
     }
+    std::vector<double> count_entropies;
+    if (entropy_table) {
+      count_entropies.resize(num_predictors);
+      for (size_t pred = 0; pred < num_predictors; ++pred) {
+        count_entropies[pred] = HistogramCountEntropy(
+            counts.data() + pred * max_symbols, max_symbols, entropy_table);
+      }
+    }
 
-    float base_bits;
-    {
+    if (!tree_samples.LosslessSpeedups()) {
       size_t pred = tree_samples.PredictorIndex((*tree)[pos].predictor);
       base_bits =
           EstimateBits(counts.data() + pred * max_symbols, max_symbols) +
@@ -288,6 +488,7 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
 
     if (best != &forced_split) {
       std::vector<int> prop_value_used_count;
+      std::vector<uint32_t> prop_value_weight;
       std::vector<int> count_increase;
       std::vector<size_t> extra_bits_increase;
       // For each property, compute which of its values are used, and what
@@ -321,6 +522,7 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
         // Clear prop_value_used_count (which cannot be cleared "on the go")
         prop_value_used_count.clear();
         prop_value_used_count.resize(prop_size);
+        if (tree_samples.LosslessSpeedups()) prop_value_weight.assign(prop_size, 0);
 
         size_t first_used = prop_size;
         size_t last_used = 0;
@@ -331,6 +533,9 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
           for (size_t i = begin; i < end; i++) {
             size_t p = tree_samples.Property<true>(prop, i);
             prop_value_used_count[p]++;
+            if (tree_samples.LosslessSpeedups()) {
+              prop_value_weight[p] += tree_samples.Count(i);
+            }
             last_used = std::max(last_used, p);
             first_used = std::min(first_used, p);
           }
@@ -339,15 +544,22 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
           for (size_t i = begin; i < end; i++) {
             size_t p = tree_samples.Property<false>(prop_idx, i);
             prop_value_used_count[p]++;
+            if (tree_samples.LosslessSpeedups()) {
+              prop_value_weight[p] += tree_samples.Count(i);
+            }
             last_used = std::max(last_used, p);
             first_used = std::min(first_used, p);
           }
         }
+        // A constant property cannot split this node. Its histograms would
+        // only be populated and cleared, once per predictor, with no result.
+        if (tree_samples.LosslessSpeedups() && first_used == last_used) continue;
         costs_l.resize(last_used - first_used);
         costs_r.resize(last_used - first_used);
         // For all predictors, compute the right and left costs of each split.
         for (size_t pred = 0; pred < num_predictors; pred++) {
           // Compute cost and histogram increments for each property value.
+          const auto before_histogram = trace ? Clock::now() : Clock::time_point{};
           const std::vector<ResidualToken> &rtokens =
               tree_samples.RTokens(pred);
           if (prop < tree_samples.NumStaticProps()) {
@@ -359,10 +571,18 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
                 tree_samples, rtokens, count_increase, extra_bits_increase,
                 begin, end, prop - tree_samples.NumStaticProps(), max_symbols);
           }
+          const auto before_entropy = trace ? Clock::now() : Clock::time_point{};
+          if (trace) {
+            histogram_seconds += std::chrono::duration<double>(
+                before_entropy - before_histogram).count();
+          }
           memcpy(counts_above.data(), counts.data() + pred * max_symbols,
                  max_symbols * sizeof counts_above[0]);
           memset(counts_below.data(), 0, max_symbols * sizeof counts_below[0]);
           size_t extra_bits_below = 0;
+          uint32_t count_below = 0;
+          double sum_above = entropy_table ? count_entropies[pred] : 0;
+          double sum_below = 0;
           // Exclude last used: this ensures neither counts_above nor
           // counts_below is empty.
           for (size_t i = first_used; i < last_used; i++) {
@@ -371,15 +591,32 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
             // The increase for this property value has been used, and will not
             // be used again: clear it. Also below.
             extra_bits_increase[i] = 0;
-            for (size_t sym = 0; sym < max_symbols; sym++) {
-              counts_above[sym] -= count_increase[i * max_symbols + sym];
-              counts_below[sym] += count_increase[i * max_symbols + sym];
-              count_increase[i * max_symbols + sym] = 0;
+            float rbits, lbits;
+            if (tree_samples.LosslessSpeedups()) {
+              count_below += prop_value_weight[i];
+              if (entropy_table) {
+                MoveCountsAndShannonBits(
+                    counts_above.data(), counts_below.data(),
+                    count_increase.data() + i * max_symbols, max_symbols,
+                    total_count - count_below, count_below, entropy_table,
+                    &sum_above, &sum_below, &rbits, &lbits);
+              } else {
+                MoveCountsAndEstimateBits(
+                    counts_above.data(), counts_below.data(),
+                    count_increase.data() + i * max_symbols, max_symbols,
+                    total_count - count_below, count_below, &rbits, &lbits);
+              }
+            } else {
+              for (size_t sym = 0; sym < max_symbols; sym++) {
+                counts_above[sym] -= count_increase[i * max_symbols + sym];
+                counts_below[sym] += count_increase[i * max_symbols + sym];
+                count_increase[i * max_symbols + sym] = 0;
+              }
+              rbits = EstimateBits(counts_above.data(), max_symbols);
+              lbits = EstimateBits(counts_below.data(), max_symbols);
             }
-            float rcost = EstimateBits(counts_above.data(), max_symbols) +
-                          tot_extra_bits[pred] - extra_bits_below;
-            float lcost = EstimateBits(counts_below.data(), max_symbols) +
-                          extra_bits_below;
+            float rcost = rbits + tot_extra_bits[pred] - extra_bits_below;
+            float lcost = lbits + extra_bits_below;
             JXL_DASSERT(extra_bits_below <= tot_extra_bits[pred]);
             float penalty = 0;
             // Never discourage moving away from the Weighted predictor.
@@ -409,6 +646,10 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
               costs_l[i - first_used].pred =
                   tree_samples.PredictorFromIndex(pred);
             }
+          }
+          if (trace) {
+            entropy_seconds += std::chrono::duration<double>(
+                Clock::now() - before_entropy).count();
           }
         }
         // Iterate through the possible splits and find the one with minimum sum
@@ -496,6 +737,16 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
       nodes.push_back(
           NodeInfo{(*tree)[pos].lchild, best->pos, end, new_sp_range});
     }
+  }
+  if (trace) {
+    const double total = std::chrono::duration<double>(Clock::now() - start).count();
+    std::fprintf(stderr,
+                 "lossless-ma samples=%" PRIuS " nodes=%" PRIuS
+                 " histogram_s=%.6f entropy_s=%.6f other_s=%.6f\n",
+                 tree_samples.NumDistinctSamples(), tree->size(),
+                 histogram_seconds, entropy_seconds,
+                 total - histogram_seconds - entropy_seconds);
+    std::fflush(stderr);
   }
 }
 
@@ -649,15 +900,24 @@ void TreeSamples::AddToTable(size_t a) {
 }
 
 void TreeSamples::PrepareForSamples(size_t extra_num_samples) {
+  const auto reserve = [&](auto& values) {
+    size_t capacity = values.size() + extra_num_samples;
+    if (lossless_speedups_ && capacity > values.capacity()) {
+      capacity = std::max(capacity, values.capacity() +
+          std::min(values.capacity() / 2, values.max_size() - values.capacity()));
+    }
+    values.reserve(capacity);
+  };
   for (auto &res : residuals) {
-    res.reserve(res.size() + extra_num_samples);
+    reserve(res);
   }
   for (size_t i = 0; i < num_static_props; ++i) {
-    static_props[i].reserve(static_props[i].size() + extra_num_samples);
+    reserve(static_props[i]);
   }
   for (auto &p : props) {
-    p.reserve(p.size() + extra_num_samples);
+    reserve(p);
   }
+  if (lossless_speedups_) reserve(sample_counts);
   size_t total_num_samples = extra_num_samples + sample_counts.size();
   size_t next_size = CeilLog2Nonzero(total_num_samples * 3 / 2);
   InitTable(next_size);

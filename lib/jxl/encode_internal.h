@@ -214,6 +214,9 @@ class JxlEncoderChunkedFrameAdapter {
   // NB: after TakeJPEGData it will return false!
   bool IsJPEG() const { return jpeg_data_ != nullptr; }
 
+  // Candidate encoders share immutable coefficients without reparsing/copying.
+  const jpeg::JPEGData* GetJPEGData() const { return jpeg_data_.get(); }
+
   std::unique_ptr<jpeg::JPEGData> TakeJPEGData() {
     return std::move(jpeg_data_);
   }

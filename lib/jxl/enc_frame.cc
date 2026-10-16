@@ -55,6 +55,7 @@
 #include "lib/jxl/enc_fields.h"
 #include "lib/jxl/enc_group.h"
 #include "lib/jxl/enc_heuristics.h"
+#include "lib/jxl/enc_lossless_search.h"
 #include "lib/jxl/enc_modular.h"
 #include "lib/jxl/enc_noise.h"
 #include "lib/jxl/enc_params.h"
@@ -510,14 +511,10 @@ Status MakeFrameHeader(size_t xsize, size_t ysize,
 
   if (jpeg_data) {
     frame_header->UpdateFlag(false, FrameHeader::kUseDcFrame);
-    // Skip smoothing if set to 0, default to 444 only and on when set to 1.
-    // Flag is whether to skip, so logic is inverted.
-      if (!((cparams.force_lfs_jpeg_recompression == -1 &&
-        frame_header->chroma_subsampling.Is444()) ||
-        cparams.force_lfs_jpeg_recompression == 1)) {
-        frame_header->UpdateFlag(true,
-        FrameHeader::kSkipAdaptiveDCSmoothing);
-      }
+    // Pre-0.13 decoders also smooth DC coefficients during JPEG reconstruction,
+    // corrupting the restored JPEG. Keep smoothing opt-in, including for 4:4:4.
+    frame_header->UpdateFlag(cparams.force_lfs_jpeg_recompression != 1,
+                             FrameHeader::kSkipAdaptiveDCSmoothing);
   }
 
   return true;
@@ -1346,6 +1343,12 @@ Status EncodeGroups(const FrameHeader& frame_header,
   const size_t global_ac_index = frame_dim.num_dc_groups + 1;
   const bool is_small_image =
       !enc_state->streaming_mode && num_groups == 1 && num_passes == 1;
+  // Small frames share one writer between sections. Only count disjoint group
+  // writers, and only for disposable pixel-lossless search candidates.
+  LosslessTrialBudget* budget =
+      !is_small_image && frame_header.encoding == FrameEncoding::kModular
+          ? enc_state->cparams.lossless_trial_budget
+          : nullptr;
   const size_t num_toc_entries =
       is_small_image ? 1
                      : AcGroupIndex(0, 0, num_groups, frame_dim.num_dc_groups) +
@@ -1391,6 +1394,7 @@ Status EncodeGroups(const FrameHeader& frame_header,
     JXL_RETURN_IF_ERROR(enc_modular->EncodeStream(get_output(0), aux_out,
                                                   LayerType::ModularGlobal,
                                                   ModularStreamId::Global()));
+    if (budget) budget->AddBytes(get_output(0)->BitsWritten() / kBitsPerByte);
   }
 
   std::vector<std::unique_ptr<AuxOut>> aux_outs;
@@ -1412,6 +1416,7 @@ Status EncodeGroups(const FrameHeader& frame_header,
 
   const auto process_dc_group = [&](const uint32_t group_index,
                                     const size_t thread) -> Status {
+    if (budget && budget->Reached()) return true;
     AuxOut* my_aux_out = aux_outs[thread].get();
     uint32_t input_index = enc_state->streaming_mode ? 0 : group_index;
     BitWriter* output = get_output(input_index + 1);
@@ -1444,6 +1449,7 @@ Status EncodeGroups(const FrameHeader& frame_header,
           output, my_aux_out, LayerType::ControlFields,
           ModularStreamId::ACMetadata(group_index)));
     }
+    if (budget) budget->AddBytes(output->BitsWritten() / kBitsPerByte);
     return true;
   };
   if (enc_state->streaming_mode) {
@@ -1462,6 +1468,7 @@ Status EncodeGroups(const FrameHeader& frame_header,
 
   const auto process_group = [&](const uint32_t group_index,
                                  const size_t thread) -> Status {
+    if (budget && budget->Reached()) return true;
     AuxOut* my_aux_out = aux_outs[thread].get();
 
     size_t ac_group_id =
@@ -1482,6 +1489,10 @@ Status EncodeGroups(const FrameHeader& frame_header,
       JXL_RETURN_IF_ERROR(enc_modular->EncodeStream(
           ac_group_code(i, group_index), my_aux_out, LayerType::ModularAcGroup,
           ModularStreamId::ModularAC(ac_group_id, i)));
+      if (budget) {
+        budget->AddBytes(ac_group_code(i, group_index)->BitsWritten() /
+                         kBitsPerByte);
+      }
       JXL_DEBUG_V(2,
                   "AC group %u [abs %" PRIuS "] pass %" PRIuS
                   " encoded size is %" PRIuS " bits",
@@ -1494,6 +1505,8 @@ Status EncodeGroups(const FrameHeader& frame_header,
                                 process_group, "EncodeGroupCoefficients"));
   // Resizing aux_outs to 0 also Assimilates the array.
   static_cast<void>(resize_aux_outs(0));
+
+  if (budget && budget->Reached()) return true;
 
   for (std::unique_ptr<BitWriter>& bw : *group_codes) {
     JXL_RETURN_IF_ERROR(bw->WithMaxBits(8, LayerType::Ac, aux_out, [&] {
@@ -2066,14 +2079,10 @@ JXL_NOINLINE Status EncodeFrameStreaming(
   auto enc_state = jxl::make_unique<PassesEncoderState>(memory_manager);
   SetProgressiveMode(cparams, &enc_state->progressive_splitter);
   FrameHeader frame_header(metadata);
-  std::unique_ptr<jpeg::JPEGData> jpeg_data;
-  if (frame_data.IsJPEG()) {
-    jpeg_data = frame_data.TakeJPEGData();
-    JXL_ENSURE(jpeg_data);
-  }
+  const jpeg::JPEGData* jpeg_data = frame_data.GetJPEGData();
   JXL_RETURN_IF_ERROR(MakeFrameHeader(frame_data.xsize, frame_data.ysize,
                                       cparams, enc_state->progressive_splitter,
-                                      frame_info, jpeg_data.get(), true,
+                                      frame_info, jpeg_data, true,
                                       &frame_header));
   const size_t num_passes = enc_state->progressive_splitter.GetNumPasses();
   JXL_ASSIGN_OR_RETURN(
@@ -2169,9 +2178,11 @@ JXL_NOINLINE Status EncodeFrameStreaming(
         std::vector<size_t>(group_xsize * group_ysize, i);
     std::vector<std::unique_ptr<BitWriter>> group_codes;
     JXL_RETURN_IF_ERROR(ComputeEncodingData(
-        cparams, frame_info, metadata, frame_data, jpeg_data.get(), x0, y0,
+        cparams, frame_info, metadata, frame_data, jpeg_data, x0, y0,
         xsize, ysize, cms, pool, frame_header, *enc_modular, *enc_state,
         &group_codes, aux_out));
+    if (cparams.lossless_trial_budget && cparams.lossless_trial_budget->Reached())
+      return true;
     JXL_ENSURE(enc_state->special_frames.empty());
     if (i == 0) {
       BitWriter writer{memory_manager};
@@ -2329,14 +2340,10 @@ Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
   auto enc_state = jxl::make_unique<PassesEncoderState>(memory_manager);
   SetProgressiveMode(cparams, &enc_state->progressive_splitter);
   FrameHeader frame_header(metadata);
-  std::unique_ptr<jpeg::JPEGData> jpeg_data;
-  if (frame_data.IsJPEG()) {
-    jpeg_data = frame_data.TakeJPEGData();
-    JXL_ENSURE(jpeg_data);
-  }
+  const jpeg::JPEGData* jpeg_data = frame_data.GetJPEGData();
   JXL_RETURN_IF_ERROR(MakeFrameHeader(frame_data.xsize, frame_data.ysize,
                                       cparams, enc_state->progressive_splitter,
-                                      frame_info, jpeg_data.get(), false,
+                                      frame_info, jpeg_data, false,
                                       &frame_header));
   const size_t num_passes = enc_state->progressive_splitter.GetNumPasses();
   JXL_ASSIGN_OR_RETURN(auto enc_modular,
@@ -2344,9 +2351,11 @@ Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
                                                    cparams, false));
   std::vector<std::unique_ptr<BitWriter>> group_codes;
   JXL_RETURN_IF_ERROR(ComputeEncodingData(
-      cparams, frame_info, metadata, frame_data, jpeg_data.get(), 0, 0,
+      cparams, frame_info, metadata, frame_data, jpeg_data, 0, 0,
       frame_data.xsize, frame_data.ysize, cms, pool, frame_header, *enc_modular,
       *enc_state, &group_codes, aux_out));
+  if (cparams.lossless_trial_budget && cparams.lossless_trial_budget->Reached())
+    return true;
 
   BitWriter writer{memory_manager};
   JXL_RETURN_IF_ERROR(writer.AppendByteAligned(enc_state->special_frames));
@@ -2570,22 +2579,16 @@ std::vector<CompressParams> TectonicPlateSettingsMorePalette(
   return all_params;
 }
 
-Status EncodeFrame(JxlMemoryManager* memory_manager,
-                   const CompressParams& cparams_orig,
-                   const FrameInfo& frame_info, const CodecMetadata* metadata,
-                   JxlEncoderChunkedFrameAdapter& frame_data,
-                   const JxlCmsInterface& cms, ThreadPool* pool,
-                   JxlEncoderOutputProcessorWrapper* output_processor,
-                   AuxOut* aux_out, uint32_t* jxlp_counter) {
+static Status EncodeFrameImpl(
+    JxlMemoryManager* memory_manager, const CompressParams& cparams_orig,
+    const FrameInfo& frame_info, const CodecMetadata* metadata,
+    JxlEncoderChunkedFrameAdapter& frame_data, const JxlCmsInterface& cms,
+    ThreadPool* pool, JxlEncoderOutputProcessorWrapper* output_processor,
+    AuxOut* aux_out, uint32_t* jxlp_counter, bool allow_lossless_search) {
   CompressParams cparams = cparams_orig;
   if (cparams.speed_tier == SpeedTier::kTectonicPlate &&
       !cparams.IsLossless()) {
     cparams.speed_tier = SpeedTier::kGlacier;
-  }
-  // Lightning mode is handled externally, so switch to Thunder mode to handle
-  // potentially weird cases.
-  if (cparams.speed_tier == SpeedTier::kLightning) {
-    cparams.speed_tier = SpeedTier::kThunder;
   }
   if (cparams.speed_tier == SpeedTier::kTectonicPlate) {
     // Test palette performance to inform later trials.
@@ -2615,9 +2618,9 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
 
     const auto process_variant = [&](size_t task, size_t) -> Status {
       JxlEncoderOutputProcessorWrapper local_output(memory_manager);
-      JXL_RETURN_IF_ERROR(EncodeFrame(
+      JXL_RETURN_IF_ERROR(EncodeFrameImpl(
           memory_manager, all_params[task], frame_info, metadata, frame_data,
-          cms, nullptr, &local_output, aux_out, nullptr));
+          cms, nullptr, &local_output, aux_out, nullptr, false));
       size[task] = local_output.CurrentPosition();
       return true;
     };
@@ -2709,6 +2712,39 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
     return JXL_FAILURE("Can't add JPEG frame to XYB codestream");
   }
 
+  if (allow_lossless_search) {
+    const auto encode_candidate =
+        [&](const CompressParams& candidate, ThreadPool* candidate_pool,
+            JxlEncoderOutputProcessorWrapper* candidate_output,
+            AuxOut* candidate_aux) -> Status {
+      return EncodeFrameImpl(memory_manager, candidate, frame_info, metadata,
+                             frame_data, cms, candidate_pool, candidate_output,
+                             candidate_aux, nullptr, false);
+    };
+    const auto encode_probe =
+        [&](const CompressParams& candidate, const CodecMetadata& probe_metadata,
+            JxlEncoderChunkedFrameAdapter& probe_input) -> StatusOr<size_t> {
+      FrameInfo probe_frame;
+      probe_frame.image_bit_depth = frame_info.image_bit_depth;
+      probe_frame.ib_needs_color_transform = frame_info.ib_needs_color_transform;
+      JxlEncoderOutputProcessorWrapper probe_output(memory_manager);
+      JXL_RETURN_IF_ERROR(EncodeFrameImpl(
+          memory_manager, candidate, probe_frame, &probe_metadata, probe_input,
+          cms, nullptr, &probe_output, nullptr, nullptr, false));
+      return probe_output.CurrentPosition();
+    };
+    JXL_ASSIGN_OR_RETURN(
+        bool searched,
+        EncodeLosslessSearch(memory_manager, cparams, frame_info, *metadata,
+                             frame_data, pool, output_processor, aux_out,
+                             encode_candidate, encode_probe));
+    if (searched) return true;
+  }
+  // Fallback for unsupported fast-lossless inputs and explicit legacy options.
+  if (cparams.speed_tier == SpeedTier::kLightning) {
+    cparams.speed_tier = SpeedTier::kThunder;
+  }
+
   if (CanDoStreamingEncoding(cparams, frame_info, *metadata, frame_data)) {
     return EncodeFrameStreaming(memory_manager, cparams, frame_info, metadata,
                                 frame_data, cms, pool, output_processor,
@@ -2722,6 +2758,18 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
     return EncodeFrameOneShot(memory_manager, cparams, frame_info, metadata,
                               frame_data, cms, pool, output_processor, aux_out);
   }
+}
+
+Status EncodeFrame(JxlMemoryManager* memory_manager,
+                   const CompressParams& cparams_orig,
+                   const FrameInfo& frame_info, const CodecMetadata* metadata,
+                   JxlEncoderChunkedFrameAdapter& frame_data,
+                   const JxlCmsInterface& cms, ThreadPool* pool,
+                   JxlEncoderOutputProcessorWrapper* output_processor,
+                   AuxOut* aux_out, uint32_t* jxlp_counter) {
+  return EncodeFrameImpl(memory_manager, cparams_orig, frame_info, metadata,
+                         frame_data, cms, pool, output_processor, aux_out,
+                         jxlp_counter, true);
 }
 
 Status EncodeFrame(JxlMemoryManager* memory_manager,

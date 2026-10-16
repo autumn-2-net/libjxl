@@ -28,6 +28,11 @@ struct ResidualToken {
 
 // Struct to collect all the data needed to build a tree.
 struct TreeSamples {
+  explicit TreeSamples(bool lossless_speedups = false, bool fast_entropy = false)
+      : lossless_speedups_(lossless_speedups || fast_entropy),
+        fast_entropy_(fast_entropy) {}
+  bool LosslessSpeedups() const { return lossless_speedups_; }
+  bool FastEntropy() const { return fast_entropy_; }
   bool HasSamples() const {
     return !residuals.empty() && !residuals[0].empty();
   }
@@ -122,6 +127,8 @@ struct TreeSamples {
   void Swap(size_t a, size_t b);
 
  private:
+  bool lossless_speedups_;
+  bool fast_entropy_;
   // TODO(veluca): as the total number of properties and predictors are known
   // before adding any samples, it might be better to interleave predictors,
   // properties and counts in a single vector to improve locality.

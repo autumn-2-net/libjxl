@@ -25,6 +25,8 @@
 
 namespace jxl {
 
+class LosslessTrialBudget;
+
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 struct CompressParams {
   float butteraugli_distance = 1.0f;
@@ -93,8 +95,9 @@ struct CompressParams {
   // effects on the decoded pixels, while still being JPEG-compliant and
   // allowing reconstruction of the original JPEG.
   bool force_cfl_jpeg_recompression = true;
-  // Apply LF Smoothing when doing JPEG recompression. Same applies as above.
-  // Default to non-subsampled smoothing only until decoders update.
+  // Apply LF smoothing when doing JPEG recompression. -1 and 0 disable it for
+  // byte-exact reconstruction with older decoders. 1 requires a decoder with
+  // the JPEG reconstruction fix from upstream PR #4931 (libjxl 0.13).
   int force_lfs_jpeg_recompression = -1;
 
   // Use brotli compression for any boxes derived from a JPEG frame.
@@ -123,6 +126,15 @@ struct CompressParams {
   float channel_colors_percent = 80.f;
   int palette_colors = 1 << 10;  // up to 10-bit palette is probably worthwhile
   bool lossy_palette = false;
+
+  // These settings have numeric defaults rather than an "auto" sentinel.
+  // Preserve an explicit API choice even when it equals the default value.
+  bool palette_colors_is_default = true;
+  bool channel_colors_percent_is_default = true;
+  bool ma_tree_learning_percent_is_default = true;
+
+  // Only set by the cumulative search for disposable, non-baseline trials.
+  LosslessTrialBudget* lossless_trial_budget = nullptr;
 
   // Returns whether these params are lossless as defined by SetLossless();
   bool IsLossless() const { return modular_mode && ModularPartIsLossless(); }

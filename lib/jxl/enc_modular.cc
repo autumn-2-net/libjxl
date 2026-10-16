@@ -11,9 +11,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -74,6 +76,34 @@ namespace jxl {
 
 namespace {
 // constexpr bool kPrintTree = false;
+
+class LosslessStageTimer {
+ public:
+  LosslessStageTimer(const CompressParams& params, const FrameDimensions& dim,
+                     const char* stage) : stage_(stage) {
+    const char* trace = std::getenv("JXL_LOSSLESS_SEARCH_TRACE");
+    enabled_ = params.IsLossless() && params.modular_mode &&
+               uint64_t{dim.xsize} * dim.ysize > 262144 && trace &&
+               std::strcmp(trace, "1") == 0;
+    if (enabled_) {
+      start_ = std::chrono::steady_clock::now();
+      std::fprintf(stderr, "lossless-modular event=start step=%s\n", stage_);
+      std::fflush(stderr);
+    }
+  }
+  ~LosslessStageTimer() {
+    if (enabled_) {
+      std::fprintf(stderr, "lossless-modular event=end step=%s seconds=%.6f\n",
+                   stage_, std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - start_).count());
+      std::fflush(stderr);
+    }
+  }
+ private:
+  const char* stage_;
+  bool enabled_;
+  std::chrono::steady_clock::time_point start_;
+};
 
 // Squeeze default quantization factors
 // these quantization factors are for -Q 50  (other qualities simply scale the
@@ -463,6 +493,12 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
                                  bool streaming_mode) {
   frame_dim_ = frame_header.ToFrameDimensions();
   cparams_ = cparams_orig;
+  cparams_.options.lossless_tree_speedups =
+      cparams_.modular_mode && cparams_.IsLossless();
+  const char* fast_entropy = std::getenv("JXL_LOSSLESS_FAST_ENTROPY");
+  cparams_.options.lossless_fast_entropy =
+      cparams_.options.lossless_tree_speedups &&
+      fast_entropy && std::strcmp(fast_entropy, "1") == 0;
 
   size_t num_streams =
       ModularStreamId::Num(frame_dim_, frame_header.passes.num_passes);
@@ -695,6 +731,7 @@ Status ModularFrameEncoder::ComputeEncodingData(
     const Rect& frame_area_rect, PassesEncoderState* JXL_RESTRICT enc_state,
     const JxlCmsInterface& cms, ThreadPool* pool, AuxOut* aux_out,
     bool do_color) {
+  LosslessStageTimer timer(cparams_, frame_dim_, "transforms");
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
   JXL_DEBUG_V(6, "Computing modular encoding data for frame %s",
               frame_header.DebugString().c_str());
@@ -1111,6 +1148,7 @@ Status ModularFrameEncoder::ComputeEncodingData(
 }
 
 Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
+  LosslessStageTimer timer(cparams_, frame_dim_, "tree");
   std::vector<ModularMultiplierInfo> multiplier_info;
   if (!quants_.empty()) {
     for (uint32_t stream_id = 0; stream_id < stream_images_.size();
@@ -1266,6 +1304,7 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
 }
 
 Status ModularFrameEncoder::ComputeTokens(ThreadPool* pool) {
+  LosslessStageTimer timer(cparams_, frame_dim_, "tokens");
   size_t num_streams = stream_images_.size();
   stream_headers_.resize(num_streams);
   tokens_.resize(num_streams);
@@ -1287,6 +1326,7 @@ Status ModularFrameEncoder::ComputeTokens(ThreadPool* pool) {
 Status ModularFrameEncoder::EncodeGlobalInfo(bool streaming_mode,
                                              BitWriter* writer,
                                              AuxOut* aux_out) {
+  LosslessStageTimer timer(cparams_, frame_dim_, "entropy");
   JxlMemoryManager* memory_manager = writer->memory_manager();
   bool skip_rest = false;
   JXL_RETURN_IF_ERROR(

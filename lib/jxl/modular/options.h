@@ -72,6 +72,12 @@ struct ModularOptions {
   // (if zero there is no MA context model)
   float nb_repeats = .5f;
 
+  // Encoder-only work reductions that preserve the learned tree exactly.
+  bool lossless_tree_speedups = false;
+
+  // Encoder-only incremental Shannon scoring; may select a different MA tree.
+  bool lossless_fast_entropy = false;
+
   // Maximum number of (previous channel) properties to use in the MA trees
   int max_properties = 0;  // no previous channels
 

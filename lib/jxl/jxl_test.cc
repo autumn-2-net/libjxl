@@ -12,16 +12,19 @@
 #include <jxl/types.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <future>
+#include <mutex>
 #include <ostream>
 #include <string>
 #include <tuple>
 #include <vector>
 
+#include "hwy/targets.h"
 #include "lib/extras/codec.h"
 #include "lib/extras/codec_in_out.h"
 #include "lib/extras/dec/decode.h"
@@ -37,11 +40,20 @@
 #include "lib/jxl/butteraugli/butteraugli.h"
 #include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/common.h"  // JXL_HIGH_PRECISION
+#include "lib/jxl/dec_bit_reader.h"
+#include "lib/jxl/enc_frame.h"
+#include "lib/jxl/enc_bit_writer.h"
+#include "lib/jxl/enc_lossless_probe.h"
+#include "lib/jxl/enc_lossless_search.h"
 #include "lib/jxl/enc_params.h"
 #include "lib/jxl/fake_parallel_runner_testonly.h"
 #include "lib/jxl/image.h"
 #include "lib/jxl/image_bundle.h"
 #include "lib/jxl/image_metadata.h"
+#include "lib/jxl/modular/encoding/enc_encoding.h"
+#include "lib/jxl/modular/encoding/encoding.h"
+#include "lib/jxl/modular/modular_image.h"
+#include "lib/jxl/modular/transform/transform.h"
 #include "lib/jxl/test_image.h"
 #include "lib/jxl/test_memory_manager.h"
 #include "lib/jxl/test_utils.h"
@@ -1070,6 +1082,517 @@ TEST(JxlTest, RoundtripAlpha16) {
   EXPECT_SLIGHTLY_BELOW(ButteraugliDistance(t.ppf(), ppf_out), 0.6);
 }
 
+TEST(JxlTest, LosslessSearchAutoOutputMode) {
+  CompressParams params;
+  params.SetLossless();
+  params.speed_tier = SpeedTier::kLightning;
+  params.output_mode = -1;
+  EXPECT_TRUE(HasLosslessSearchOptions(params));
+  params.output_mode = 0;
+  EXPECT_TRUE(HasLosslessSearchOptions(params));
+  params.output_mode = 1;
+  EXPECT_FALSE(HasLosslessSearchOptions(params));
+  params.output_mode = 2;
+  EXPECT_FALSE(HasLosslessSearchOptions(params));
+  params.output_mode = -1;
+  params.buffering = 3;
+  EXPECT_FALSE(HasLosslessSearchOptions(params));
+}
+
+TEST(JxlTest, LosslessFrameSearchRetainsSmallerCandidates) {
+  ThreadPoolForTests pool(4);
+  for (size_t bits : {8, 16}) {
+    TestImage t;
+    ASSERT_TRUE(t.SetDimensions(137, 96));
+    ASSERT_TRUE(t.SetChannels(4));
+    t.SetAllBitDepths(bits);
+    JXL_TEST_ASSIGN_OR_DIE(auto frame, t.AddFrame());
+    const uint32_t maxval = (1u << bits) - 1;
+    for (size_t y = 0; y < 96; ++y) {
+      for (size_t x = 0; x < 137; ++x) {
+        for (size_t c = 0; c < 4; ++c) {
+          const uint32_t value =
+              c == 3 ? (x % 3) * (maxval / 2)
+                     : ((x % 13) * 103 + (y % 17) * 47 + c) % (maxval + 1);
+          ASSERT_TRUE(frame.SetValue(y, x, c, value * (1.0f / maxval)));
+        }
+      }
+    }
+    JXLCompressParams params;
+    params.distance = 0.0;
+    params.AddOption(JXL_ENC_FRAME_SETTING_KEEP_INVISIBLE, 1);
+    JXLDecompressParams dparams;
+    dparams.accepted_formats.push_back(t.ppf().frames[0].color.format);
+    PackedPixelFile decoded;
+    size_t previous_size = 0;
+    for (int effort = 1; effort <= 10; ++effort) {
+      auto candidate = params;
+      candidate.AddOption(JXL_ENC_FRAME_SETTING_EFFORT, effort);
+      const size_t size =
+          Roundtrip(t.ppf(), candidate, dparams, pool.get(), &decoded);
+      ASSERT_GT(size, 0u);
+      EXPECT_EQ(ComputeDistance2(t.ppf(), decoded), 0.0);
+      if (previous_size != 0) EXPECT_LE(size, previous_size);
+      previous_size = size;
+    }
+  }
+}
+
+TEST(JxlTest, LosslessFrameSearchSmallFixedPredictors) {
+  TestImage t;
+  ASSERT_TRUE(t.SetDimensions(32, 32));
+  ASSERT_TRUE(t.SetChannels(1));
+  t.SetAllBitDepths(16);
+  JXL_TEST_ASSIGN_OR_DIE(auto frame, t.AddFrame());
+  for (size_t y = 0; y < 32; ++y) {
+    for (size_t x = 0; x < 32; ++x) {
+      ASSERT_TRUE(frame.SetValue(y, x, 0, (x * 2000 + y % 4) / 65535.f));
+    }
+  }
+  JXLCompressParams params;
+  params.distance = 0;
+  params.AddOption(JXL_ENC_FRAME_SETTING_EFFORT, 9);
+  JXLDecompressParams dparams;
+  dparams.accepted_formats.push_back(t.ppf().frames[0].color.format);
+  PackedPixelFile decoded;
+  const size_t searched =
+      Roundtrip(t.ppf(), params, dparams, nullptr, &decoded);
+  ASSERT_GT(searched, 0u);
+  EXPECT_EQ(ComputeDistance2(t.ppf(), decoded), 0.0);
+  params.AddOption(JXL_ENC_FRAME_SETTING_MODULAR_PREDICTOR, 2);
+  params.AddFloatOption(JXL_ENC_FRAME_SETTING_MODULAR_MA_TREE_LEARNING_PERCENT,
+                        0.f);
+  const size_t fixed_top =
+      Roundtrip(t.ppf(), params, dparams, nullptr, &decoded);
+  ASSERT_GT(fixed_top, 0u);
+  EXPECT_EQ(ComputeDistance2(t.ppf(), decoded), 0.0);
+  EXPECT_LE(searched, fixed_top);
+}
+
+TEST(JxlTest, LosslessSearchFeedbackAndRunnerOrder) {
+  // Mock byte costs exercise the policy without relying on a photographic
+  // training sample continuing to favor the same predictor after updates.
+  JxlMemoryManager* memory = test::MemoryManager();
+  CodecMetadata metadata;
+  ASSERT_TRUE(metadata.size.Set(257, 257));
+  metadata.m.SetUintSamples(8);
+  metadata.m.color_encoding = ColorEncoding::SRGB();
+  std::vector<uint8_t> pixels(257 * 257 * 3, 0);
+  JxlEncoderChunkedFrameAdapter input(257, 257, 0);
+  ASSERT_TRUE(input.SetFromBuffer(0, pixels.data(), pixels.size(),
+                                  {3, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0}));
+  FrameInfo frame_info;
+  for (int scenario : {0, 1, 2}) {
+    const bool literal_wins = scenario == 1;
+    std::vector<uint8_t> serial_result;
+    for (int order : {0, 17, 91}) {
+      FakeParallelRunner runner(order, 4);
+      ThreadPool pool(&JxlFakeParallelRunner, &runner);
+      size_t previous = 0;
+      for (int effort = 1; effort <= 10; ++effort) {
+        CompressParams params;
+        params.SetLossless();
+        params.speed_tier = static_cast<SpeedTier>(10 - effort);
+        JxlEncoderOutputProcessorWrapper output(memory);
+        int ordinary_calls = 0;
+        int learned_calls = 0;
+        const auto encode = [&](const CompressParams& p, ThreadPool* inner,
+                                JxlEncoderOutputProcessorWrapper* out,
+                                AuxOut*) -> Status {
+          const bool literal = p.options.predictor == Predictor::Zero;
+          if (literal && p.options.nb_repeats > 0) ++learned_calls;
+          if (!literal) ++ordinary_calls;
+          // Scenario 2 models the map regression: a poor fixed-tree probe,
+          // followed by a learned tree that beats the initially winning
+          // literal.
+          const size_t bytes =
+              literal
+                  ? (scenario != 0 ? 50 : 500)
+                  : (scenario == 2 && p.speed_tier != SpeedTier::kFalcon ? 25
+                                                                         : 200);
+          if (effort >= 2 && p.speed_tier == SpeedTier::kFalcon)
+            EXPECT_EQ(inner, nullptr);
+          return AppendData(*out, std::vector<uint8_t>(bytes, literal ? 1 : 2));
+        };
+        JXL_TEST_ASSIGN_OR_DIE(
+            bool searched,
+            EncodeLosslessSearch(memory, params, frame_info, metadata, input,
+                                 order == 0 ? nullptr : &pool, &output, nullptr,
+                                 encode));
+        ASSERT_TRUE(searched);
+        ASSERT_TRUE(output.SetFinalizedPosition());
+        std::vector<uint8_t> bytes;
+        ASSERT_TRUE(output.CopyOutput(bytes));
+        if (previous) EXPECT_LE(bytes.size(), previous);
+        previous = bytes.size();
+        if (literal_wins && effort >= 2)
+          EXPECT_EQ(ordinary_calls, effort >= 3 ? 2 : 1);
+        if (scenario == 0 || scenario == 2) EXPECT_EQ(learned_calls, 0);
+        if (scenario == 2 && effort >= 3) EXPECT_EQ(bytes.size(), 25);
+        if (effort == 10) {
+          if (order == 0)
+            serial_result = bytes;
+          else
+            EXPECT_EQ(bytes, serial_result);
+        }
+      }
+    }
+  }
+}
+
+TEST(JxlTest, LosslessProbePreservesSourceSamples) {
+  constexpr size_t width = 257;
+  constexpr size_t height = 131;
+  constexpr size_t stride = 2304;  // RGBA16 padded to 256-byte alignment.
+  CodecMetadata metadata;
+  ASSERT_TRUE(metadata.size.Set(width, height));
+  metadata.m.SetUintSamples(16);
+  metadata.m.color_encoding = ColorEncoding::SRGB();
+  metadata.m.SetAlphaBits(16);
+  metadata.m.extra_channel_info.emplace_back();
+  metadata.m.num_extra_channels = 2;
+  metadata.m.extra_channel_info[1].type = ExtraChannel::kSelectionMask;
+  metadata.m.extra_channel_info[1].bit_depth.bits_per_sample = 16;
+  metadata.m.have_animation = true;
+  std::vector<uint8_t> pixels(stride * height, 0xa5);
+  std::vector<uint8_t> mask(width * height * 2);
+  const auto store = [](uint8_t* p, size_t value) {
+    p[0] = value >> 8;
+    p[1] = value & 255;
+  };
+  const auto load = [](const uint8_t* p) -> size_t {
+    return (size_t{p[0]} << 8) | p[1];
+  };
+  for (size_t y = 0; y < height; ++y) {
+    for (size_t x = 0; x < width; ++x) {
+      uint8_t* p = pixels.data() + y * stride + 8 * x;
+      store(p, x);
+      store(p + 2, y);
+      store(p + 4, x + 3 * y);
+      store(p + 6, x < 64 ? 0 : 12345);
+      store(mask.data() + 2 * (y * width + x), 29 * x + y);
+    }
+  }
+  const auto original = pixels;
+  JxlEncoderChunkedFrameAdapter input(width, height, 2);
+  ASSERT_TRUE(input.SetFromBuffer(0, pixels.data(), pixels.size(),
+                                  {4, JXL_TYPE_UINT16, JXL_BIG_ENDIAN, 256}));
+  ASSERT_TRUE(input.SetFromBuffer(2, mask.data(), mask.size(),
+                                  {1, JXL_TYPE_UINT16, JXL_BIG_ENDIAN, 0}));
+  CompressParams params;
+  params.SetLossless();
+  std::atomic<size_t> calls{0};
+  const auto encode = [&](const CompressParams& p, const CodecMetadata& m,
+                          JxlEncoderChunkedFrameAdapter& sample)
+      -> StatusOr<size_t> {
+    ++calls;
+    EXPECT_EQ(sample.xsize, 96u);
+    EXPECT_EQ(sample.ysize, 96u);
+    EXPECT_EQ(m.xsize(), sample.xsize);
+    EXPECT_FALSE(m.m.have_animation);
+    auto source = sample.GetInputSource();
+    JxlPixelFormat format{};
+    source.get_color_channels_pixel_format(source.opaque, &format);
+    EXPECT_EQ(format.endianness, JXL_BIG_ENDIAN);
+    EXPECT_EQ(format.align, 0u);
+    size_t row_stride;
+    auto color = GetColorBuffer(source, 0, 0, 96, 96, &row_stride);
+    size_t mask_stride;
+    auto extra = GetExtraChannelBuffer(source, 1, 0, 0, 96, 96, &mask_stride);
+    const auto* data = static_cast<const uint8_t*>(color.get());
+    const auto* selection = static_cast<const uint8_t*>(extra.get());
+    const size_t x0 = load(data);
+    const size_t y0 = load(data + 2);
+    for (size_t y : {0, 47, 95}) {
+      for (size_t x : {0, 47, 95}) {
+        const uint8_t* pixel = data + y * row_stride + x * 8;
+        EXPECT_EQ(load(pixel), x0 + x);
+        EXPECT_EQ(load(pixel + 2), y0 + y);
+        EXPECT_EQ(load(pixel + 4), x0 + x + 3 * (y0 + y));
+        EXPECT_EQ(load(pixel + 6), x0 + x < 64 ? 0u : 12345u);
+        EXPECT_EQ(load(selection + y * mask_stride + 2 * x),
+                  29 * (x0 + x) + y0 + y);
+      }
+    }
+    return size_t{p.colorspace == 0 && p.options.predictor == Predictor::Gradient
+                      ? 100u : 1000u};
+  };
+  ThreadPoolForTests pool(4);
+  JXL_TEST_ASSIGN_OR_DIE(auto result, ProbeLosslessCandidates(
+      params, metadata, input, pool.get(), encode));
+  EXPECT_EQ(result.samples, 9u);
+  EXPECT_EQ(result.encodes, calls.load());
+  ASSERT_FALSE(result.ranked.empty());
+  EXPECT_STREQ(result.ranked[0].name, "raw-gradient");
+  EXPECT_EQ(result.ranked[0].bytes, 900u);
+  EXPECT_EQ(pixels, original);
+}
+
+TEST(JxlTest, LosslessTrialBudgetSaturates) {
+  LosslessTrialBudget zero(0);
+  EXPECT_TRUE(zero.Reached());
+  const size_t maximum = std::numeric_limits<size_t>::max();
+  LosslessTrialBudget large(maximum);
+  large.AddBytes(maximum - 1);
+  EXPECT_FALSE(large.Reached());
+  large.AddBytes(2);
+  EXPECT_TRUE(large.Reached());
+  large.AddBytes(maximum);
+  EXPECT_TRUE(large.Reached());
+  LosslessTrialBudget parallel(1025);
+  ThreadPoolForTests pool(4);
+  ASSERT_TRUE(RunOnPool(pool.get(), 0, 1024, ThreadPool::NoInit,
+                        [&](uint32_t, size_t) -> Status {
+                          parallel.AddBytes(1);
+                          return true;
+                        }, "LosslessBudgetTest"));
+  EXPECT_FALSE(parallel.Reached());
+  parallel.AddBytes(1);
+  EXPECT_TRUE(parallel.Reached());
+}
+
+TEST(JxlTest, LosslessTwoPassPreservesCumulativeCandidates) {
+  JxlMemoryManager* memory = test::MemoryManager();
+  CodecMetadata metadata;
+  ASSERT_TRUE(metadata.size.Set(513, 513));
+  metadata.m.SetUintSamples(8);
+  metadata.m.color_encoding = ColorEncoding::SRGB();
+  std::vector<uint8_t> pixels(513 * 513 * 3, 17);
+  JxlEncoderChunkedFrameAdapter input(513, 513, 0);
+  ASSERT_TRUE(input.SetFromBuffer(0, pixels.data(), pixels.size(),
+                                  {3, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0}));
+  FrameInfo frame_info;
+  // A good sample estimate can still lose on the full image. Both cases must
+  // preserve the old policy's complete candidate set and stable higher levels.
+  for (bool misleading : {false, true}) {
+    std::vector<uint8_t> serial_output;
+    for (int order : {0, 19, 71}) {
+      FakeParallelRunner runner(order, 4);
+      ThreadPool pool(&JxlFakeParallelRunner, &runner);
+      std::vector<std::tuple<int, int, int, int, bool>> previous_calls;
+      size_t previous_size = 0;
+      for (int effort = 7; effort <= 10; ++effort) {
+        CompressParams params;
+        params.SetLossless();
+        params.speed_tier = static_cast<SpeedTier>(10 - effort);
+        std::mutex mutex;
+        std::vector<std::tuple<int, int, int, int, bool>> calls;
+        bool legacy_e10_seen = false;
+        const auto encode = [&](const CompressParams& p, ThreadPool*,
+                                JxlEncoderOutputProcessorWrapper* output,
+                                AuxOut*) -> Status {
+          {
+            std::lock_guard<std::mutex> lock(mutex);
+            calls.emplace_back(static_cast<int>(p.speed_tier),
+                               static_cast<int>(p.options.predictor),
+                               p.palette_colors, p.colorspace,
+                               p.lz77_careful_first_pass);
+            legacy_e10_seen |= p.speed_tier == SpeedTier::kGlacier &&
+                              !p.lz77_careful_first_pass;
+          }
+          size_t size = 500;
+          if (p.colorspace == 0 && p.options.predictor == Predictor::Gradient)
+            size = misleading ? 900 : 300;
+          if (p.colorspace == 6 && p.options.predictor == Predictor::Gradient)
+            size = misleading ? 800 : 250;
+          if (p.colorspace == 0 && p.options.predictor == Predictor::Weighted)
+            size = misleading ? 700 : 280;
+          if (p.lz77_careful_first_pass) size = misleading ? 600 : 200;
+          if (p.lossless_trial_budget) {
+            p.lossless_trial_budget->AddBytes(size);
+            if (p.lossless_trial_budget->Reached()) {
+              // Deliberately leave a tiny, invalid partial output. It must not
+              // displace the real winner or change later candidate selection.
+              return AppendData(*output, std::vector<uint8_t>(1, 99));
+            }
+          }
+          return AppendData(*output, std::vector<uint8_t>(size, 7));
+        };
+        const auto probe = [](const CompressParams& p, const CodecMetadata&,
+                               JxlEncoderChunkedFrameAdapter&) -> StatusOr<size_t> {
+          if (p.lz77_careful_first_pass) return size_t{50};
+          if (p.colorspace == 0 && p.options.predictor == Predictor::Gradient)
+            return size_t{100};
+          if (p.colorspace == 6 && p.options.predictor == Predictor::Gradient)
+            return size_t{110};
+          if (p.colorspace == 0 && p.options.predictor == Predictor::Weighted)
+            return size_t{120};
+          return size_t{1000};
+        };
+        JxlEncoderOutputProcessorWrapper output(memory);
+        JXL_TEST_ASSIGN_OR_DIE(bool searched, EncodeLosslessSearch(
+            memory, params, frame_info, metadata, input,
+            order == 0 ? nullptr : &pool, &output, nullptr, encode, probe));
+        ASSERT_TRUE(searched);
+        ASSERT_TRUE(output.SetFinalizedPosition());
+        std::vector<uint8_t> bytes;
+        ASSERT_TRUE(output.CopyOutput(bytes));
+        if (previous_size) EXPECT_LE(bytes.size(), previous_size);
+        previous_size = bytes.size();
+        std::sort(calls.begin(), calls.end());
+        EXPECT_TRUE(std::includes(calls.begin(), calls.end(),
+                                   previous_calls.begin(), previous_calls.end()));
+        previous_calls = calls;
+        if (misleading) EXPECT_EQ(bytes.size(), 500u);
+        if (effort == 10) {
+          EXPECT_TRUE(legacy_e10_seen);
+          EXPECT_EQ(bytes.size(), misleading ? 500u : 200u);
+          if (order == 0) serial_output = bytes;
+          else EXPECT_EQ(bytes, serial_output);
+        }
+      }
+    }
+  }
+}
+
+TEST(JxlTest, LosslessConfirmationRejectsMisleadingSmallSamples) {
+  constexpr size_t width = 1025, height = 513;
+  CodecMetadata metadata;
+  ASSERT_TRUE(metadata.size.Set(width, height));
+  metadata.m.SetUintSamples(16);
+  metadata.m.color_encoding = ColorEncoding::SRGB();
+  metadata.m.SetAlphaBits(16);
+  std::vector<uint16_t> pixels(width * height * 4);
+  for (size_t y = 0; y < height; ++y) {
+    for (size_t x = 0; x < width; ++x) {
+      auto* p = pixels.data() + 4 * (y * width + x);
+      p[0] = x;
+      p[1] = y;
+      p[2] = x + y;
+      p[3] = x < 700 ? 0 : 12345;
+    }
+  }
+  JxlEncoderChunkedFrameAdapter input(width, height, 1);
+  ASSERT_TRUE(input.SetFromBuffer(0, reinterpret_cast<const uint8_t*>(pixels.data()), pixels.size() * 2,
+                                  {4, JXL_TYPE_UINT16, JXL_NATIVE_ENDIAN, 0}));
+  CompressParams params;
+  params.SetLossless();
+  params.speed_tier = SpeedTier::kTortoise;
+  auto incumbent = params;
+  incumbent.colorspace = 6;
+  incumbent.options.nb_repeats = 0.5f;
+  const auto encode = [&](const CompressParams& p, const CodecMetadata& m,
+                          JxlEncoderChunkedFrameAdapter& sample)
+      -> StatusOr<size_t> {
+    EXPECT_EQ(m.m.bit_depth.bits_per_sample, 16u);
+    auto source = sample.GetInputSource();
+    size_t stride;
+    auto buffer = GetColorBuffer(source, 0, 0, sample.xsize, sample.ysize, &stride);
+    const auto* row = static_cast<const uint16_t*>(buffer.get());
+    EXPECT_EQ(row[2], row[0] + row[1]);
+    EXPECT_EQ(row[3], row[0] < 700 ? 0 : 12345);
+    const bool candidate = p.colorspace == 0 && p.options.predictor == Predictor::Gradient;
+    if (sample.xsize == 96) return size_t{candidate ? 100u : 1000u};
+    EXPECT_EQ(sample.xsize, 512u);
+    EXPECT_EQ(sample.ysize, 512u);
+    EXPECT_TRUE(candidate || p.colorspace == 6);
+    return size_t{candidate ? 2000u : 1000u};
+  };
+  for (size_t threads : {0, 4}) {
+    ThreadPoolForTests pool(threads);
+    JXL_TEST_ASSIGN_OR_DIE(auto ranked, ProbeLosslessCandidates(
+        params, metadata, input, pool.get(), encode));
+    ASSERT_FALSE(ranked.ranked.empty());
+    EXPECT_STREQ(ranked.ranked[0].name, "raw-gradient");
+    JXL_TEST_ASSIGN_OR_DIE(auto result, ConfirmLosslessCandidate(
+        ranked.ranked[0].params, incumbent, metadata, input, pool.get(), encode));
+    EXPECT_EQ(result.samples, 3u);
+    EXPECT_EQ(result.candidate_bytes, 6000u);
+    EXPECT_EQ(result.incumbent_bytes, 3000u);
+    EXPECT_FALSE(result.accepted);
+    std::atomic<size_t> cached_calls{0};
+    const auto cached_encode = [&](const CompressParams& p, const CodecMetadata& m,
+                                    JxlEncoderChunkedFrameAdapter& sample)
+        -> StatusOr<size_t> {
+      ++cached_calls;
+      EXPECT_EQ(p.colorspace, 0);
+      return encode(p, m, sample);
+    };
+    JXL_TEST_ASSIGN_OR_DIE(auto cached, ConfirmLosslessCandidate(
+        ranked.ranked[0].params, incumbent, metadata, input, pool.get(),
+        cached_encode, result.incumbent_bytes));
+    EXPECT_EQ(cached_calls.load(), 3u);
+    EXPECT_EQ(cached.candidate_bytes, result.candidate_bytes);
+    EXPECT_EQ(cached.incumbent_bytes, result.incumbent_bytes);
+    EXPECT_EQ(cached.accepted, result.accepted);
+  }
+}
+
+TEST(JxlTest, LosslessTreeScoringRoundtrip) {
+  auto* memory = test::MemoryManager();
+  struct RestoreTargets {
+    ~RestoreTargets() { hwy::SetSupportedTargetsForTest(0); }
+  } restore_targets;
+  constexpr size_t width = 257, height = 131;
+  for (int64_t target : hwy::SupportedAndGeneratedTargets()) {
+    hwy::SetSupportedTargetsForTest(target);
+    SCOPED_TRACE(hwy::TargetName(target));
+  for (int pattern = 0; pattern < 5; ++pattern) {
+    JXL_TEST_ASSIGN_OR_DIE(Image image,
+                           Image::Create(memory, width, height, 16, 4));
+    for (size_t c = 0; c < 4; ++c) {
+      for (size_t y = 0; y < height; ++y) {
+        for (size_t x = 0; x < width; ++x) {
+          image.channel[c].Row(y)[x] =
+              pattern == 0   ? 17
+              : pattern == 1 ? (x / 8 + y / 8 + c) % 2 * 65535
+              : pattern == 2 ? (x * 257 + y * 31 + c * 1000) % 65536
+                             : (x * 19391 + y * 311 + x * y * 1777 + c) % 65536;
+          if (pattern == 4) {
+            image.channel[c].Row(y)[x] =
+                static_cast<int>((x * 373 + y * 929 + c * 17) % 65536) - 32768;
+          }
+        }
+      }
+    }
+    for (Predictor predictor :
+         {Predictor::Zero, Predictor::Best, Predictor::Variable}) {
+      for (float fraction : {0.0f, 0.01f, 0.5f, 1.0f}) {
+        SCOPED_TRACE(testing::Message() << pattern << ":"
+                                       << static_cast<int>(predictor) << ":"
+                                       << fraction);
+        ModularOptions options;
+        options.predictor = predictor;
+        options.nb_repeats = fraction;
+        BitWriter old_writer(memory), new_writer(memory);
+        ASSERT_TRUE(ModularGenericCompress(image, options, old_writer));
+        options.lossless_tree_speedups = true;
+        ASSERT_TRUE(ModularGenericCompress(image, options, new_writer));
+        EXPECT_EQ(old_writer.BitsWritten(), new_writer.BitsWritten());
+        old_writer.ZeroPadToByte();
+        new_writer.ZeroPadToByte();
+        ASSERT_EQ(old_writer.GetSpan().size(), new_writer.GetSpan().size());
+        EXPECT_TRUE(std::equal(old_writer.GetSpan().begin(),
+                               old_writer.GetSpan().end(),
+                               new_writer.GetSpan().begin()));
+        options.lossless_fast_entropy = true;
+        BitWriter fast_writer(memory);
+        ASSERT_TRUE(ModularGenericCompress(image, options, fast_writer));
+        fast_writer.ZeroPadToByte();
+        JXL_TEST_ASSIGN_OR_DIE(Image decoded,
+                               Image::Create(memory, width, height, 16, 4));
+        Status status = true;
+        {
+          BitReader reader(fast_writer.GetSpan());
+          BitReaderScopedCloser closer(reader, status);
+          ASSERT_TRUE(ModularGenericDecompress(
+              &reader, decoded, nullptr, 0, &options));
+        }
+        ASSERT_TRUE(status);
+        ASSERT_EQ(decoded.channel.size(), image.channel.size());
+        for (size_t c = 0; c < 4; ++c) {
+          for (size_t y = 0; y < height; ++y) {
+            EXPECT_TRUE(std::equal(image.channel[c].Row(y),
+                                   image.channel[c].Row(y) + width,
+                                   decoded.channel[c].Row(y)));
+          }
+        }
+      }
+    }
+  }
+  }
+}
+
 JXL_SLOW_TEST(JxlTest, RoundtripLossless8) {
   ThreadPoolForTests pool(8);
   const std::vector<uint8_t> orig =
@@ -1085,7 +1608,7 @@ JXL_SLOW_TEST(JxlTest, RoundtripLossless8) {
   PackedPixelFile ppf_out;
   size_t compressed_size =
       Roundtrip(t.ppf(), cparams, dparams, pool.get(), &ppf_out);
-  EXPECT_EQ(compressed_size, 218284u);
+  EXPECT_EQ(compressed_size, 218285u);
   EXPECT_EQ(ComputeDistance2(t.ppf(), ppf_out), 0.0);
 }
 
@@ -1105,7 +1628,7 @@ JXL_SLOW_TEST(JxlTest, RoundtripLossless8ThunderGradient) {
 
   PackedPixelFile ppf_out;
   EXPECT_EQ(Roundtrip(t.ppf(), cparams, dparams, pool.get(), &ppf_out),
-            261613u);
+            261614u);
   EXPECT_EQ(ComputeDistance2(t.ppf(), ppf_out), 0.0);
 }
 
@@ -1144,7 +1667,7 @@ JXL_SLOW_TEST(JxlTest, RoundtripLossless8Falcon) {
 
   PackedPixelFile ppf_out;
   EXPECT_EQ(Roundtrip(t.ppf(), cparams, dparams, pool.get(), &ppf_out),
-            230697u);
+            230698u);
   EXPECT_EQ(ComputeDistance2(t.ppf(), ppf_out), 0.0);
 }
 
@@ -1165,7 +1688,7 @@ TEST(JxlTest, RoundtripLossless8Alpha) {
 
   PackedPixelFile ppf_out;
   size_t compressed_size = Roundtrip(t.ppf(), cparams, dparams, pool, &ppf_out);
-  EXPECT_EQ(compressed_size, 246071u);
+  EXPECT_EQ(compressed_size, 246072u);
   EXPECT_EQ(ComputeDistance2(t.ppf(), ppf_out), 0.0);
   EXPECT_EQ(ppf_out.info.alpha_bits, 8u);
   EXPECT_TRUE(test::SameAlpha(t.ppf(), ppf_out));
@@ -1432,7 +1955,11 @@ TEST(JxlTest, RoundtripAnimationPatches) {
 
 size_t RoundtripJpeg(const std::vector<uint8_t>& jpeg_in, ThreadPool* pool) {
   std::vector<uint8_t> compressed;
-  EXPECT_TRUE(extras::EncodeImageJXL({}, extras::PackedPixelFile(), &jpeg_in,
+  JXLCompressParams params;
+  // Keep historical byte-size goldens on the legacy backend. The cumulative
+  // scheduler has separate full-effort exact-reconstruction tests below.
+  params.AddFloatOption(JXL_ENC_FRAME_SETTING_MODULAR_MA_TREE_LEARNING_PERCENT, 50.f);
+  EXPECT_TRUE(extras::EncodeImageJXL(params, extras::PackedPixelFile(), &jpeg_in,
                                      &compressed));
 
   jxl::JXLDecompressParams dparams;
@@ -1627,6 +2154,72 @@ JXL_TRANSCODE_JPEG_TEST(JxlTest, RoundtripJpegRecompressionMetadata) {
   // JPEG size is 4290 bytes
   // 1370 on 386, so higher margin.
   EXPECT_NEAR(RoundtripJpeg(orig, pool.get()), 1334u, 100u);
+}
+
+JXL_TRANSCODE_JPEG_TEST(JxlTest, JpegLfSmoothingRequiresOptIn) {
+  const auto original =
+      ReadTestData("jxl/jpeg_reconstruction/sideways_bench.jpg");
+  // A same-version roundtrip alone misses this bug: libjxl 0.12 smooths the
+  // reconstructed DC coefficients unless the encoder sets the skip flag.
+  for (bool legacy_backend : {false, true}) {
+    for (int effort : {1, 9}) {
+      SCOPED_TRACE(testing::Message() << "legacy=" << legacy_backend
+                                     << " effort=" << effort);
+      JXLCompressParams params;
+      params.AddOption(JXL_ENC_FRAME_SETTING_EFFORT, effort);
+      if (legacy_backend) {
+        params.AddFloatOption(
+            JXL_ENC_FRAME_SETTING_MODULAR_MA_TREE_LEARNING_PERCENT, 50.f);
+      }
+      std::vector<uint8_t> default_stream;
+      ASSERT_TRUE(extras::EncodeImageJXL(params, PackedPixelFile(), &original,
+                                         &default_stream));
+      for (int smoothing : {-1, 0, 1}) {
+        SCOPED_TRACE(testing::Message() << "smoothing=" << smoothing);
+        auto explicit_params = params;
+        explicit_params.AddOption(JXL_ENC_FRAME_SETTING_JPEG_RECON_LFS,
+                                   smoothing);
+        std::vector<uint8_t> compressed;
+        ASSERT_TRUE(extras::EncodeImageJXL(explicit_params, PackedPixelFile(),
+                                           &original, &compressed));
+        if (smoothing == 1) {
+          EXPECT_NE(compressed, default_stream);
+        } else {
+          EXPECT_EQ(compressed, default_stream);
+        }
+        std::vector<uint8_t> restored;
+        PackedPixelFile decoded;
+        ASSERT_TRUE(extras::DecodeImageJXL(compressed.data(), compressed.size(),
+                                           {}, nullptr, &decoded, &restored));
+        EXPECT_EQ(restored, original);
+      }
+    }
+  }
+}
+
+JXL_TRANSCODE_JPEG_TEST(JxlTest, LosslessSearchJpegCumulative) {
+  ThreadPoolForTests pool(4);
+  for (const char* name : {"jxl/jpeg_reconstruction/sideways_bench.jpg",
+                           "jxl/jpeg_reconstruction/1x1_exif_xmp.jpg",
+                           "jxl/flower/flower.png.im_q85_420_progr.jpg"}) {
+    const auto original = ReadTestData(name);
+    size_t previous_size = 0;
+    for (int effort = 1; effort <= 10; ++effort) {
+      JXLCompressParams params;
+      params.AddOption(JXL_ENC_FRAME_SETTING_EFFORT, effort);
+      test::SetThreadParallelRunner(params, pool.get());
+      std::vector<uint8_t> compressed;
+      ASSERT_TRUE(extras::EncodeImageJXL(params, PackedPixelFile(), &original,
+                                         &compressed));
+      if (previous_size != 0) EXPECT_LE(compressed.size(), previous_size);
+      previous_size = compressed.size();
+      std::vector<uint8_t> restored;
+      PackedPixelFile decoded;
+      ASSERT_TRUE(extras::DecodeImageJXL(compressed.data(), compressed.size(),
+                                         {}, nullptr, &decoded, &restored));
+      EXPECT_EQ(restored, original);
+    }
+  }
 }
 
 JXL_TRANSCODE_JPEG_TEST(JxlTest, RoundtripJpegRecompressionEmptyExif) {

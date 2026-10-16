@@ -25,6 +25,7 @@
 #include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/enc_aux_out.h"
 #include "lib/jxl/enc_bit_writer.h"
+#include "lib/jxl/enc_lossless_search.h"
 #include "lib/jxl/enc_params.h"
 #include "lib/jxl/fields.h"
 #include "lib/jxl/frame_header.h"
@@ -286,6 +287,25 @@ Status SetColorTransformFromJpegData(const JPEGData& jpg,
 Status EncodeJPEGData(JxlMemoryManager* memory_manager, JPEGData& jpeg_data,
                       std::vector<uint8_t>* bytes,
                       const CompressParams& cparams) {
+  if (cparams.brotli_effort < 0 && HasLosslessSearchOptions(cparams)) {
+    // The reconstruction box must obey the same cumulative size contract as
+    // the coefficient frame. Explicit Brotli quality still bypasses this
+    // search.
+    const int level = LosslessSearchLevel(cparams);
+    bytes->clear();
+    for (const auto& stage :
+         {std::pair<int, int>{1, 3}, {4, 6}, {7, 9}, {10, 11}}) {
+      if (stage.first > level) break;
+      CompressParams candidate = cparams;
+      candidate.brotli_effort = stage.second;
+      std::vector<uint8_t> encoded;
+      JXL_RETURN_IF_ERROR(
+          EncodeJPEGData(memory_manager, jpeg_data, &encoded, candidate));
+      if (bytes->empty() || encoded.size() < bytes->size())
+        bytes->swap(encoded);
+    }
+    return true;
+  }
   bytes->clear();
   jpeg_data.app_marker_type.resize(jpeg_data.app_data.size(),
                                    AppMarkerType::kUnknown);
