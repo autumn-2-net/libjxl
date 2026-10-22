@@ -49,6 +49,7 @@
 #include "lib/jxl/enc_cache.h"
 #include "lib/jxl/enc_chroma_from_luma.h"
 #include "lib/jxl/enc_coeff_order.h"
+#include "lib/jxl/enc_final_plan.h"
 #include "lib/jxl/enc_context_map.h"
 #include "lib/jxl/enc_entropy_coder.h"
 #include "lib/jxl/enc_external_image.h"
@@ -56,6 +57,8 @@
 #include "lib/jxl/enc_group.h"
 #include "lib/jxl/enc_heuristics.h"
 #include "lib/jxl/enc_lossless_search.h"
+#include "lib/jxl/enc_lossless_profile.h"
+#include "lib/jxl/enc_ma_search.h"
 #include "lib/jxl/enc_modular.h"
 #include "lib/jxl/enc_noise.h"
 #include "lib/jxl/enc_params.h"
@@ -65,6 +68,8 @@
 #include "lib/jxl/enc_quant_weights.h"
 #include "lib/jxl/enc_splines.h"
 #include "lib/jxl/enc_toc.h"
+#include "lib/jxl/enc_tool_policy.h"
+#include "lib/jxl/enc_direct_plan.h"
 #include "lib/jxl/enc_xyb.h"
 #include "lib/jxl/encode_internal.h"
 #include "lib/jxl/fields.h"
@@ -969,8 +974,26 @@ Status ComputeJPEGTranscodingData(const jpeg::JPEGData& jpeg_data,
         return true;
       };
 
-      JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, map->ysize(), ThreadPool::NoInit,
-                                    process_row, "FindCorrelation"));
+      if (!ReplayingFinalPlan()) {
+        JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, map->ysize(), ThreadPool::NoInit,
+                                      process_row, "FindCorrelation"));
+      }
+      if (CurrentFinalPlan()) {
+        std::vector<int64_t> values;
+        if (!ReplayingFinalPlan()) {
+          for (size_t y = 0; y < map->ysize(); ++y) {
+            for (size_t x = 0; x < map->xsize(); ++x) values.push_back(map->Row(y)[x]);
+          }
+        }
+        JXL_RETURN_IF_ERROR(FinalPlanExchange("cfl", &values));
+        JXL_ENSURE(values.size() == map->xsize() * map->ysize());
+        for (size_t y = 0, i = 0; y < map->ysize(); ++y) {
+          for (size_t x = 0; x < map->xsize(); ++x, ++i) {
+            JXL_ENSURE(values[i] >= -128 && values[i] <= 127);
+            map->Row(y)[x] = values[i];
+          }
+        }
+      }
     }
   }
 
@@ -1078,6 +1101,7 @@ Status ComputeJPEGTranscodingData(const jpeg::JPEGData& jpeg_data,
   for (size_t i = 0; i < 3; i++) {
     dct[i].clear();
   }
+  if (!ReplayingFinalPlan()) {
   // use more contexts for larger and higher quality images
   int num_thresholds = CeilLog2Nonzero(total_dc[1]) -
                        CeilLog2Nonzero(static_cast<unsigned>(
@@ -1093,6 +1117,17 @@ Status ComputeJPEGTranscodingData(const jpeg::JPEGData& jpeg_data,
       dct[1].push_back(j - 1025);
       cut = total_dc[1] * (dct[1].size() + 1) / (num_thresholds + 1);
     }
+  }
+  }
+  if (CurrentFinalPlan()) {
+    std::vector<int64_t> values(dct[1].begin(), dct[1].end());
+    JXL_RETURN_IF_ERROR(FinalPlanExchange("dc_thresholds", &values));
+    JXL_ENSURE(values.size() <= 7);
+    for (size_t i = 0; i < values.size(); ++i) {
+      JXL_ENSURE(values[i] >= -1025 && values[i] < 1024 &&
+                 (i == 0 || values[i] > values[i - 1]));
+    }
+    dct[1].assign(values.begin(), values.end());
   }
   num_dc_ctxs = dct[1].size() + 1;
 
@@ -1173,9 +1208,11 @@ Status ComputeVarDCTEncodingData(const FrameHeader& frame_header,
 
 Status ComputeAllCoeffOrders(PassesEncoderState& enc_state,
                              const FrameDimensions& frame_dim) {
+  if (!ReplayingFinalPlan()) {
   auto used_orders_info = ComputeUsedOrders(
       enc_state.cparams.speed_tier, enc_state.shared.ac_strategy,
       Rect(enc_state.shared.raw_quant_field));
+  if (enc_state.cparams.direct_plan >= 0) used_orders_info.second = 0;
   enc_state.used_orders.resize(enc_state.progressive_splitter.GetNumPasses());
   for (size_t i = 0; i < enc_state.progressive_splitter.GetNumPasses(); i++) {
     JXL_RETURN_IF_ERROR(ComputeCoeffOrder(
@@ -1185,6 +1222,38 @@ Status ComputeAllCoeffOrders(PassesEncoderState& enc_state,
         &enc_state.shared.coeff_orders[i * enc_state.shared.coeff_order_size]));
   }
   enc_state.used_acs |= used_orders_info.first;
+  }
+  if (CurrentFinalPlan()) {
+    const size_t passes = enc_state.progressive_splitter.GetNumPasses();
+    JXL_ENSURE(passes == 1);
+    std::vector<int64_t> values;
+    if (!ReplayingFinalPlan()) {
+      JXL_ENSURE(enc_state.used_acs == 1 && enc_state.used_orders.size() == 1 &&
+                 enc_state.used_orders[0] <= 1);
+      values.push_back(enc_state.used_orders[0]);
+      for (size_t c = 0; c < 3; ++c) {
+        size_t offset = CoeffOrderOffset(0, c);
+        for (size_t i = 0; i < 64; ++i) values.push_back(enc_state.shared.coeff_orders[offset + i]);
+      }
+    }
+    JXL_RETURN_IF_ERROR(FinalPlanExchange("coeff_order", &values));
+    JXL_ENSURE(values.size() == 193 && values[0] >= 0 && values[0] <= 1);
+    enc_state.used_acs = 1;
+    enc_state.used_orders.assign(1, values[0]);
+    coeff_order_t natural[64];
+    AcStrategy::FromRawStrategy(0).ComputeNaturalCoeffOrder(natural);
+    for (size_t c = 0; c < 3; ++c) {
+      std::array<bool, 64> seen{};
+      size_t offset = CoeffOrderOffset(0, c);
+      for (size_t i = 0; i < 64; ++i) {
+        const auto v = values[1 + 64 * c + i];
+        JXL_ENSURE(v >= 0 && v < 64 && !seen[v] && (i != 0 || v == 0));
+        JXL_ENSURE(values[0] != 0 || v == natural[i]);
+        seen[v] = true;
+        enc_state.shared.coeff_orders[offset + i] = v;
+      }
+    }
+  }
   return true;
 }
 
@@ -1242,12 +1311,12 @@ Status TokenizeAllCoefficients(const FrameHeader& frame_header,
 }
 
 Status EncodeGlobalDCInfo(const PassesSharedState& shared, BitWriter* writer,
-                          AuxOut* aux_out) {
+                          AuxOut* aux_out, const HistogramParams* direct) {
   // Encode quantizer DC and global scale.
   QuantizerParams params = shared.quantizer.GetParams();
   JXL_RETURN_IF_ERROR(
       WriteQuantizerParams(params, writer, LayerType::Quant, aux_out));
-  JXL_RETURN_IF_ERROR(EncodeBlockCtxMap(shared.block_ctx_map, writer, aux_out));
+  JXL_RETURN_IF_ERROR(EncodeBlockCtxMap(shared.block_ctx_map, writer, aux_out, direct));
   JXL_RETURN_IF_ERROR(ColorCorrelationEncodeDC(shared.cmap.base(), writer,
                                                LayerType::Dc, aux_out));
   return true;
@@ -1292,6 +1361,8 @@ Status EncodeGlobalACInfo(PassesEncoderState* enc_state, BitWriter* writer,
     // Encode histograms.
     HistogramParams hist_params(enc_state->cparams.speed_tier,
                                 shared.block_ctx_map.NumACContexts());
+    hist_params.lz77_careful_first_pass = enc_state->cparams.lz77_careful_first_pass;
+    hist_params.tool_policy_domain = enc_state->cparams.lossless_tool_domain;
     if (enc_state->cparams.speed_tier > SpeedTier::kTortoise) {
       hist_params.lz77_method = HistogramParams::LZ77Method::kNone;
     }
@@ -1318,6 +1389,9 @@ Status EncodeGlobalACInfo(PassesEncoderState* enc_state, BitWriter* writer,
     }
     hist_params.streaming_mode = enc_state->streaming_mode;
     hist_params.initialize_global_state = enc_state->initialize_global_state;
+    if (enc_state->cparams.direct_plan >= 0) {
+      hist_params = enc_state->cparams.options.histogram_params;
+    }
     JXL_ASSIGN_OR_RETURN(
         size_t cost,
         BuildAndEncodeHistograms(
@@ -1387,10 +1461,13 @@ Status EncodeGroups(const FrameHeader& frame_header,
     JXL_RETURN_IF_ERROR(DequantMatricesEncodeDC(shared.matrices, get_output(0),
                                                 LayerType::Quant, aux_out));
     if (frame_header.encoding == FrameEncoding::kVarDCT) {
-      JXL_RETURN_IF_ERROR(EncodeGlobalDCInfo(shared, get_output(0), aux_out));
+      JXL_RETURN_IF_ERROR(EncodeGlobalDCInfo(
+          shared, get_output(0), aux_out,
+          enc_state->cparams.direct_plan >= 0 ?
+              &enc_state->cparams.options.histogram_params : nullptr));
     }
     JXL_RETURN_IF_ERROR(enc_modular->EncodeGlobalInfo(enc_state->streaming_mode,
-                                                      get_output(0), aux_out));
+                                                      get_output(0), aux_out, pool));
     JXL_RETURN_IF_ERROR(enc_modular->EncodeStream(get_output(0), aux_out,
                                                   LayerType::ModularGlobal,
                                                   ModularStreamId::Global()));
@@ -2087,7 +2164,8 @@ JXL_NOINLINE Status EncodeFrameStreaming(
   const size_t num_passes = enc_state->progressive_splitter.GetNumPasses();
   JXL_ASSIGN_OR_RETURN(
       auto enc_modular,
-      ModularFrameEncoder::Create(memory_manager, frame_header, cparams, true));
+      ModularFrameEncoder::Create(memory_manager, frame_header, cparams, true,
+                                   jpeg_data != nullptr));
   std::vector<coeff_order_t> permutation;
   std::vector<size_t> dc_group_order;
   size_t group_size = frame_header.ToFrameDimensions().group_dim;
@@ -2348,7 +2426,8 @@ Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
   const size_t num_passes = enc_state->progressive_splitter.GetNumPasses();
   JXL_ASSIGN_OR_RETURN(auto enc_modular,
                        ModularFrameEncoder::Create(memory_manager, frame_header,
-                                                   cparams, false));
+                                                   cparams, false,
+                                                   jpeg_data != nullptr));
   std::vector<std::unique_ptr<BitWriter>> group_codes;
   JXL_RETURN_IF_ERROR(ComputeEncodingData(
       cparams, frame_info, metadata, frame_data, jpeg_data, 0, 0,
@@ -2586,6 +2665,79 @@ static Status EncodeFrameImpl(
     ThreadPool* pool, JxlEncoderOutputProcessorWrapper* output_processor,
     AuxOut* aux_out, uint32_t* jxlp_counter, bool allow_lossless_search) {
   CompressParams cparams = cparams_orig;
+  if (allow_lossless_search && FinalPlanInput() && !CurrentFinalPlan()) {
+    JXL_ENSURE(!FinalPlanOutput() && !DirectPlanRequested() && !MaSearchRequested() &&
+               !LosslessToolPolicyEnabled());
+    JXL_ENSURE(frame_data.IsJPEG() || cparams.IsLossless());
+    FinalPlan plan;
+    JXL_RETURN_IF_ERROR(plan.Read(FinalPlanInput()));
+    FinalPlanScope scope(&plan);
+    JXL_RETURN_IF_ERROR(FinalPlanParameters(&cparams));
+    const Status replay_status = EncodeFrameImpl(memory_manager, cparams, frame_info,
+        metadata, frame_data, cms, nullptr, output_processor, aux_out,
+        jxlp_counter, false);
+    if (!replay_status) {
+      std::fprintf(stderr, "final-plan mode=replay failed_after_record=%zu kind=%s\n",
+                   plan.cursor, plan.cursor ? plan.records[plan.cursor - 1].name.c_str() : "none");
+      return replay_status;
+    }
+    JXL_RETURN_IF_ERROR(plan.Finished());
+    std::fprintf(stderr, "final-plan mode=replay records=%zu consumed=%zu\n",
+                 plan.records.size(), plan.cursor);
+    return true;
+  }
+  if (auto* plan = CurrentFinalPlan()) {
+    JXL_ENSURE(pool == nullptr && !frame_data.StreamingInput() &&
+               (frame_data.IsJPEG() || cparams.IsLossless()) &&
+               !metadata->m.bit_depth.floating_point_sample &&
+               metadata->m.bit_depth.bits_per_sample <= 16);
+    const size_t channels = (metadata->m.color_encoding.IsGray() ? 1 : 3) +
+                            metadata->m.num_extra_channels;
+    std::vector<int64_t> shape{frame_data.IsJPEG() ? 2 : 1,
+        static_cast<int64_t>(frame_data.xsize), static_cast<int64_t>(frame_data.ysize),
+        static_cast<int64_t>(channels)};
+    auto expected = shape;
+    JXL_RETURN_IF_ERROR(FinalPlanExchange("input", &shape));
+    JXL_ENSURE(shape == expected);
+    plan->tree_limit = std::min<size_t>(1 << 22,
+        1024 + uint64_t(frame_data.xsize) * frame_data.ysize * channels / 16);
+  }
+  if (!cparams.options.ma_search && MaSearchRequested() &&
+      (frame_data.IsJPEG() || cparams.IsLossless())) {
+    const auto encode = [&](const CompressParams& p, ThreadPool* runner,
+                            JxlEncoderOutputProcessorWrapper* sink,
+                            AuxOut* stats) -> Status {
+      return EncodeFrameImpl(memory_manager, p, frame_info, metadata, frame_data,
+                             cms, runner, sink, stats, nullptr, false);
+    };
+    return EncodeMaSearch(memory_manager, cparams, frame_info, *metadata,
+                          frame_data, pool, output_processor, aux_out, encode);
+  }
+  if (cparams.direct_plan < 0 && DirectPlanRequested() &&
+      (frame_data.IsJPEG() || cparams.IsLossless())) {
+    const auto encode = [&](const CompressParams& p, ThreadPool* runner,
+                            JxlEncoderOutputProcessorWrapper* sink,
+                            AuxOut* stats) -> Status {
+      return EncodeFrameImpl(memory_manager, p, frame_info, metadata, frame_data,
+                             cms, runner, sink, stats, nullptr, false);
+    };
+    return EncodeDirectPlan(memory_manager, cparams, *metadata, frame_data,
+                            pool, output_processor, aux_out, encode);
+  }
+  if (cparams.direct_plan >= 0) {
+    JXL_ENSURE(cparams.options.histogram_params.direct_audit != nullptr);
+    ++cparams.options.histogram_params.direct_audit->frames;
+  }
+  LosslessProfileScope profile_frame(
+      cparams.options.histogram_params.lossless_profile, "frame",
+      allow_lossless_search && (cparams.IsLossless() || frame_data.IsJPEG()) &&
+                      LosslessProfileRequested());
+  if (profile_frame.Enabled()) {
+    profile_frame.Set("width", frame_data.xsize);
+    profile_frame.Set("height", frame_data.ysize);
+    profile_frame.Set("backend", 10 - static_cast<int>(cparams.speed_tier));
+    cparams.options.histogram_params.lossless_profile = profile_frame.Id();
+  }
   if (cparams.speed_tier == SpeedTier::kTectonicPlate &&
       !cparams.IsLossless()) {
     cparams.speed_tier = SpeedTier::kGlacier;
@@ -2697,6 +2849,11 @@ static Status EncodeFrameImpl(
     cparams.gaborish = Override::kOff;
     cparams.epf = 0;
     cparams.modular_mode = false;
+    // The faster first-pass estimate can choose a worse optimal LZ77 parse
+    // for JPEG coefficients. Keep the careful seed at the deep backend.
+    if (cparams.speed_tier <= SpeedTier::kTortoise) {
+      cparams.lz77_careful_first_pass = true;
+    }
   }
 
   if (frame_data.xsize == 0 || frame_data.ysize == 0) {
@@ -2712,7 +2869,11 @@ static Status EncodeFrameImpl(
     return JXL_FAILURE("Can't add JPEG frame to XYB codestream");
   }
 
-  if (allow_lossless_search) {
+  if (cparams.direct_plan < 0 && LosslessToolPolicyEnabled()) {
+    cparams.lossless_tool_domain = frame_data.IsJPEG() ? 2 :
+        (cparams.IsLossless() ? 1 : 0);
+  }
+  if (allow_lossless_search && cparams.direct_plan < 0 && cparams.lossless_tool_domain == 0) {
     const auto encode_candidate =
         [&](const CompressParams& candidate, ThreadPool* candidate_pool,
             JxlEncoderOutputProcessorWrapper* candidate_output,
@@ -2724,13 +2885,32 @@ static Status EncodeFrameImpl(
     const auto encode_probe =
         [&](const CompressParams& candidate, const CodecMetadata& probe_metadata,
             JxlEncoderChunkedFrameAdapter& probe_input) -> StatusOr<size_t> {
+      LosslessProfileScope profile(candidate.options.histogram_params.lossless_profile,
+                                   "probe");
+      profile.Set("width", probe_input.xsize);
+      profile.Set("height", probe_input.ysize);
+      profile.Set("predictor", static_cast<uint32_t>(candidate.options.predictor));
+      profile.Set("rct_plus_one", static_cast<uint64_t>(candidate.colorspace + 1));
+      auto profiled_candidate = candidate;
+      const char* probe_lz77 = std::getenv("JXL_LOSSLESS_PROBE_LZ77");
+      profiled_candidate.lossless_disposable_probe = true;
+      const uint64_t original_pixels = uint64_t{frame_data.xsize} * frame_data.ysize;
+      const bool compact_probe = original_pixels >= (1u << 19) && original_pixels < (2u << 20);
+      if (candidate.IsLossless() && probe_lz77 &&
+          (probe_lz77[0] == '1' || probe_lz77[0] == '2' ||
+           (probe_lz77[0] == '3' && compact_probe)) && probe_lz77[1] == '\0') {
+        profiled_candidate.lossless_probe_lz77 = probe_lz77[0] == '3' ? 1 : probe_lz77[0] - '0';
+      }
+      if (profile.Enabled()) {
+        profiled_candidate.options.histogram_params.lossless_profile = profile.Id();
+      }
       FrameInfo probe_frame;
       probe_frame.image_bit_depth = frame_info.image_bit_depth;
       probe_frame.ib_needs_color_transform = frame_info.ib_needs_color_transform;
       JxlEncoderOutputProcessorWrapper probe_output(memory_manager);
       JXL_RETURN_IF_ERROR(EncodeFrameImpl(
-          memory_manager, candidate, probe_frame, &probe_metadata, probe_input,
-          cms, nullptr, &probe_output, nullptr, nullptr, false));
+          memory_manager, profiled_candidate, probe_frame, &probe_metadata, probe_input,
+          cms, candidate.lossless_probe_runner, &probe_output, nullptr, nullptr, false));
       return probe_output.CurrentPosition();
     };
     JXL_ASSIGN_OR_RETURN(

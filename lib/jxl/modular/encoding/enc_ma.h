@@ -10,6 +10,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "lib/jxl/base/common.h"
@@ -21,6 +22,8 @@
 
 namespace jxl {
 
+class ThreadPool;
+
 struct ResidualToken {
   uint8_t tok;
   uint8_t nbits;
@@ -28,11 +31,16 @@ struct ResidualToken {
 
 // Struct to collect all the data needed to build a tree.
 struct TreeSamples {
-  explicit TreeSamples(bool lossless_speedups = false, bool fast_entropy = false)
+  explicit TreeSamples(bool lossless_speedups = false, bool fast_entropy = false,
+                       bool channel_tree_eligible = false)
       : lossless_speedups_(lossless_speedups || fast_entropy),
-        fast_entropy_(fast_entropy) {}
+        fast_entropy_(fast_entropy),
+        channel_tree_eligible_(lossless_speedups_ && channel_tree_eligible),
+        fast_dedup_(lossless_speedups_ && FastDedupRequested()) {}
   bool LosslessSpeedups() const { return lossless_speedups_; }
   bool FastEntropy() const { return fast_entropy_; }
+  bool ChannelTreeEligible() const { return channel_tree_eligible_; }
+  bool FastDedup() const { return fast_dedup_; }
   bool HasSamples() const {
     return !residuals.empty() && !residuals[0].empty();
   }
@@ -78,6 +86,21 @@ struct TreeSamples {
       return props[property_index][i];
     }
   }
+  template <bool S>
+  const auto* PropertyData(size_t property_index) const {
+    if constexpr (S) {
+      return static_props[property_index].data();
+    } else {
+      return props[property_index].data();
+    }
+  }
+  template <bool S>
+  bool SameProperty(size_t a, size_t b, size_t begin, size_t end) const {
+    if (begin == end) return true;
+    const auto* first = PropertyData<S>(a) + begin;
+    const auto* second = PropertyData<S>(b) + begin;
+    return std::memcmp(first, second, (end - begin) * sizeof(*first)) == 0;
+  }
   int UnquantizeProperty(size_t property_index, uint32_t quant) const {
     JXL_DASSERT(quant < compact_properties[property_index].size());
     return compact_properties[property_index][quant];
@@ -109,7 +132,21 @@ struct TreeSamples {
       std::vector<pixel_type> &pixel_samples,
       std::vector<pixel_type> &diff_samples, size_t max_property_values);
 
-  void AllSamplesDone() { dedup_table_ = std::vector<uint32_t>(); }
+  void AllSamplesDone() {
+    FlushSampleBatch();
+    dedup_table_ = std::vector<uint32_t>();
+  }
+  void SetSampleBatching(bool enabled) {
+    FlushSampleBatch();
+    sample_batching_ = enabled && lossless_speedups_ && fast_dedup_;
+  }
+  void FlushSampleBatch();
+
+  // Merge weighted, already-quantized batches into an empty sample set with
+  // the same predictor/property configuration. Does not expand repeated samples.
+  Status MergeSamples(std::vector<TreeSamples>& batches);
+  // Append another wave before AllSamplesDone(), retaining weighted samples.
+  Status AppendSamples(std::vector<TreeSamples>& batches);
 
   uint32_t QuantizeProperty(uint32_t prop, pixel_type v) const {
     JXL_DASSERT(prop >= num_static_props);
@@ -125,10 +162,16 @@ struct TreeSamples {
 
   // Swaps samples in position a and b. Does nothing if a == b.
   void Swap(size_t a, size_t b);
+  // Apply a batch of swaps one sample field at a time for better locality.
+  void SwapBatch(const size_t* a, const size_t* b, size_t count);
 
  private:
   bool lossless_speedups_;
   bool fast_entropy_;
+  bool channel_tree_eligible_;
+  bool fast_dedup_;
+  bool sample_batching_ = false;
+  size_t pending_samples_ = 0;
   // TODO(veluca): as the total number of properties and predictors are known
   // before adding any samples, it might be better to interleave predictors,
   // properties and counts in a single vector to improve locality.
@@ -139,7 +182,7 @@ struct TreeSamples {
   // Number of occurrences of each sample.
   std::vector<uint16_t> sample_counts;
   // Quantized static property values
-  size_t num_static_props;
+  size_t num_static_props = 0;
   std::array<std::vector<uint32_t>, kNumStaticProperties> static_props;
   // Property values, quantized to at most 256 distinct values.
   std::vector<std::vector<uint8_t>> props;
@@ -161,13 +204,20 @@ struct TreeSamples {
   std::vector<uint32_t> dedup_table_;
 
   // Functions for sample deduplication.
+  static bool FastDedupRequested();
   bool IsSameSample(size_t a, size_t b) const;
   size_t Hash1(size_t a) const;
   size_t Hash2(size_t a) const;
+  void HashBatch(size_t begin, size_t count, uint64_t* first,
+                 uint64_t* second) const;
+  void MergeSampleBatch(const TreeSamples& batch, size_t begin, size_t end);
   void InitTable(size_t log_size);
   // Returns true if `a` was already present in the table.
   bool AddToTableAndMerge(size_t a);
+  bool AddWeightedToTableAndMerge(size_t a);
+  bool AddWeightedToTableAndMerge(size_t a, size_t pos1, size_t pos2);
   void AddToTable(size_t a);
+  void AddToTable(size_t a, size_t pos1, size_t pos2);
 };
 
 Status TokenizeTree(const Tree &tree, std::vector<Token> *tokens,
@@ -183,7 +233,8 @@ void CollectPixelSamples(const Image &image, const ModularOptions &options,
 Status ComputeBestTree(TreeSamples &tree_samples, float threshold,
                        const std::vector<ModularMultiplierInfo> &mul_info,
                        StaticPropRange static_prop_range,
-                       float fast_decode_multiplier, Tree *tree);
+                       float fast_decode_multiplier, Tree *tree,
+                       ThreadPool *pool = nullptr);
 
 }  // namespace jxl
 #endif  // LIB_JXL_MODULAR_ENCODING_ENC_MA_H_

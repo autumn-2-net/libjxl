@@ -11,6 +11,7 @@
 #include <jxl/types.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +20,8 @@
 
 #include "lib/extras/packed_image.h"
 #include "lib/jxl/base/exif.h"
+#include "lib/jxl/cms/color_encoding_cms.h"
+#include "lib/jxl/cms/jxl_cms_internal.h"
 
 namespace jxl {
 namespace extras {
@@ -80,6 +83,10 @@ bool SetupFrame(JxlEncoder* enc, JxlEncoderFrameSettings* settings,
     JxlExtraChannelInfo extra_channel_info;
     JxlEncoderInitExtraChannelInfo(JXL_CHANNEL_ALPHA, &extra_channel_info);
     extra_channel_info.bits_per_sample = ppf.info.alpha_bits;
+    if (params.distance == 0) {
+      extra_channel_info.bits_per_sample =
+          std::max(extra_channel_info.bits_per_sample, ppf.lossless_alpha_bits);
+    }
     extra_channel_info.exponent_bits_per_sample = ppf.info.alpha_exponent_bits;
     extra_channel_info.alpha_premultiplied = ppf.info.alpha_premultiplied;
     if (params.premultiply != -1) {
@@ -281,6 +288,12 @@ bool EncodeImageJXL(const JXLCompressParams& params, const PackedPixelFile& ppf,
     const bool non_perceptual = non_perceptual_option != params.options.end() &&
                                 non_perceptual_option->ival == 1;
     basic_info.uses_original_profile = TO_JXL_BOOL(lossless || non_perceptual);
+    if (lossless) {
+      basic_info.bits_per_sample =
+          std::max(basic_info.bits_per_sample, ppf.lossless_color_bits);
+      basic_info.alpha_bits =
+          std::max(basic_info.alpha_bits, ppf.lossless_alpha_bits);
+    }
     if (params.override_bitdepth != 0) {
       basic_info.bits_per_sample = params.override_bitdepth;
       basic_info.exponent_bits_per_sample =
@@ -321,6 +334,27 @@ bool EncodeImageJXL(const JXLCompressParams& params, const PackedPixelFile& ppf,
       if (JXL_ENC_SUCCESS !=
           JxlEncoderSetICCProfile(enc, ppf.icc.data(), ppf.icc.size())) {
         fprintf(stderr, "JxlEncoderSetICCProfile() failed.\n");
+        return false;
+      }
+    } else if (lossless &&
+               ppf.color_encoding.transfer_function == JXL_TRANSFER_FUNCTION_GAMMA &&
+               std::isfinite(ppf.color_encoding.gamma) &&
+               ppf.color_encoding.gamma > 0 &&
+               (ppf.color_encoding.gamma > 1 ||
+                ppf.color_encoding.gamma < 1.0 / cms::CustomTransferFunction::kMaxGamma)) {
+      // PNG permits curves outside the codestream's compact gamma range.
+      // Store an ICC curve instead; never substitute sRGB or transform samples.
+      auto external = ppf.color_encoding;
+      external.transfer_function = JXL_TRANSFER_FUNCTION_LINEAR;
+      cms::ColorEncoding normalized;
+      if (!normalized.FromExternal(external)) return false;
+      external = normalized.ToExternal();
+      external.transfer_function = JXL_TRANSFER_FUNCTION_GAMMA;
+      external.gamma = ppf.color_encoding.gamma;
+      std::vector<uint8_t> profile;
+      if (!MaybeCreateProfile(external, &profile) ||
+          JXL_ENC_SUCCESS != JxlEncoderSetICCProfile(enc, profile.data(), profile.size())) {
+        fprintf(stderr, "Storing gamma as an ICC profile failed.\n");
         return false;
       }
     } else {

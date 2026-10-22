@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -15,8 +17,12 @@
 #include <tuple>
 #include <vector>
 
+#include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/enc_ans_params.h"
+#include "lib/jxl/enc_lossless_profile.h"
+#include "lib/jxl/enc_lossless_workers.h"
+#include "lib/jxl/enc_cluster_bound.h"
 
 #undef HWY_TARGET_INCLUDE
 #define HWY_TARGET_INCLUDE "lib/jxl/enc_cluster.cc"
@@ -163,9 +169,19 @@ float HistogramKLDivergence(const Histogram& actual, const Histogram& coding) {
 
 // First step of a k-means clustering with a fancy distance metric.
 Status FastClusterHistograms(const std::vector<Histogram>& in,
-                             size_t max_histograms, bool prefix_codes,
+                             size_t max_histograms, const HistogramParams& params,
                              std::vector<Histogram>* out,
                              std::vector<uint32_t>* histogram_symbols) {
+  const bool prefix_codes = params.force_huffman;
+  LosslessProfileScope seed(LosslessProfileCurrent(), "cluster.seed");
+  const char* parallel_env = std::getenv("JXL_LOSSLESS_CLUSTER_PARALLEL");
+  const size_t tasks = LosslessWorkerLimits::FromEnvironment().Tasks(
+      DivCeil(in.size(), size_t{2048}), 0);
+  const bool parallel = params.lossless_lz77_cost_spans &&
+      params.lossless_lz77_pool && !params.direct_audit && tasks > 1 &&
+      (!parallel_env || std::strcmp(parallel_env, "1") == 0);
+  seed.Set("tasks", parallel ? tasks : 1);
+  std::vector<size_t> furthest(parallel ? tasks : 0);
   const size_t prev_histograms = out->size();
   out->reserve(max_histograms);
   histogram_symbols->clear();
@@ -207,15 +223,43 @@ Status FastClusterHistograms(const std::vector<Histogram>& in,
     out->push_back(in[largest_idx]);
     dists[largest_idx] = 0.0f;
     largest_idx = 0;
-    for (size_t i = 0; i < in.size(); i++) {
-      if (dists[i] == 0.0f) continue;
-      dists[i] =
-          std::min(ClusterDistance(in[i], out->back(), prefix_codes), dists[i]);
-      if (dists[i] > dists[largest_idx]) largest_idx = i;
+    if (parallel) {
+      const auto distances = [&](uint32_t task, size_t) -> Status {
+        const size_t begin = in.size() * task / tasks;
+        const size_t end = in.size() * (task + 1) / tasks;
+        size_t best = begin;
+        for (size_t i = begin; i < end; ++i) {
+          if (dists[i] != 0.0f) {
+            dists[i] = std::min(
+                ClusterDistance(in[i], out->back(), prefix_codes), dists[i]);
+          }
+          if (dists[i] > dists[best]) best = i;
+        }
+        furthest[task] = best;
+        return true;
+      };
+      JXL_RETURN_IF_ERROR(RunOnPool(params.lossless_lz77_pool, 0, tasks,
+                                    ThreadPool::NoInit, distances,
+                                    "ClusterSeedDistances"));
+      // Each block retains its first maximum; ordered reduction preserves
+      // the seed tie break without serializing the distance calculations.
+      for (size_t index : furthest) {
+        if (dists[index] > dists[largest_idx]) largest_idx = index;
+      }
+    } else {
+      for (size_t i = 0; i < in.size(); i++) {
+        if (dists[i] == 0.0f) continue;
+        dists[i] =
+            std::min(ClusterDistance(in[i], out->back(), prefix_codes), dists[i]);
+        if (dists[i] > dists[largest_idx]) largest_idx = i;
+      }
     }
     if (dists[largest_idx] < kMinDistanceForDistinct) break;
   }
 
+  seed.Set("centers", out->size());
+  seed.Finish();
+  LosslessProfileScope assign(LosslessProfileCurrent(), "cluster.assign");
   for (size_t i = 0; i < in.size(); i++) {
     if ((*histogram_symbols)[i] != max_histograms) continue;
     size_t best = 0;
@@ -301,9 +345,10 @@ Status ClusterHistograms(const HistogramParams& params,
   }
 
   JXL_RETURN_IF_ERROR(HWY_DYNAMIC_DISPATCH(FastClusterHistograms)(
-      in, prev_histograms + max_histograms, params.force_huffman, out,
+      in, prev_histograms + max_histograms, params, out,
       histogram_symbols));
 
+  LosslessProfileScope refine(LosslessProfileCurrent(), "cluster.refine");
   if (prev_histograms == 0 &&
       params.clustering == HistogramParams::ClusteringType::kBest) {
     for (auto& histo : *out) {
@@ -313,6 +358,15 @@ Status ClusterHistograms(const HistogramParams& params,
     std::vector<uint32_t> version(out->size(), 1);
     std::vector<uint32_t> renumbering(out->size());
     std::iota(renumbering.begin(), renumbering.end(), 0);
+    const char* bound_env = std::getenv("JXL_LOSSLESS_CLUSTER_BOUND");
+    const bool use_bound = params.lossless_lz77_cost_spans && !params.direct_audit &&
+        bound_env && std::strcmp(bound_env, "1") == 0;
+    std::vector<ClusterEntropySketch> sketches;
+    if (use_bound) {
+      for (const auto& histogram : *out) sketches.push_back(MakeClusterEntropySketch(histogram.counts));
+    }
+    std::vector<size_t> bounded_rows(out->size(), 0);
+    size_t bounded_updates = 0;
 
     // Try to pair up clusters if doing so reduces the total cost.
 
@@ -333,8 +387,18 @@ Status ClusterHistograms(const HistogramParams& params,
 
     // Create list of all pairs by increasing merging cost.
     std::priority_queue<HistogramPair> pairs_to_merge;
-    for (uint32_t i = 0; i < out->size(); i++) {
+    const char* parallel_env = std::getenv("JXL_LOSSLESS_CLUSTER_PARALLEL");
+    const bool parallel = params.lossless_lz77_pool && params.lossless_lz77_cost_spans &&
+        !params.direct_audit && out->size() >= 32 && parallel_env &&
+        std::strcmp(parallel_env, "1") == 0;
+    std::vector<std::vector<HistogramPair>> rows(parallel ? out->size() : 0);
+    const auto build_row = [&](uint32_t i, size_t) -> Status {
       for (uint32_t j = i + 1; j < out->size(); j++) {
+        if (use_bound && ClusterMergeLowerBound(sketches[i], sketches[j]) >=
+                            double((*out)[i].entropy) + (*out)[j].entropy) {
+          ++bounded_rows[i];
+          continue;
+        }
         Histogram histo;
         histo.AddHistogram((*out)[i]);
         histo.AddHistogram((*out)[j]);
@@ -342,9 +406,26 @@ Status ClusterHistograms(const HistogramParams& params,
         cost -= (*out)[i].entropy + (*out)[j].entropy;
         // Avoid enqueueing pairs that are not advantageous to merge.
         if (cost >= 0) continue;
-        pairs_to_merge.push(
-            HistogramPair{cost, i, j, std::max(version[i], version[j])});
+        const HistogramPair pair{cost, i, j, std::max(version[i], version[j])};
+        if (parallel) rows[i].push_back(pair);
+        else pairs_to_merge.push(pair);
       }
+      return true;
+    };
+    if (parallel) {
+      refine.Set("parallel_pairs", out->size());
+      const size_t tasks = LosslessWorkerLimits::FromEnvironment().Tasks(out->size(), 1u << 20);
+      const auto work = [&](uint32_t task, size_t thread) -> Status {
+        for (size_t i = task; i < out->size(); i += tasks) {
+          JXL_RETURN_IF_ERROR(build_row(i, thread));
+        }
+        return true;
+      };
+      JXL_RETURN_IF_ERROR(RunOnPool(params.lossless_lz77_pool, 0, tasks,
+          ThreadPool::NoInit, work, "ClusterPairCosts"));
+      for (const auto& row : rows) for (const auto& pair : row) pairs_to_merge.push(pair);
+    } else {
+      for (uint32_t i = 0; i < out->size(); ++i) JXL_RETURN_IF_ERROR(build_row(i, 0));
     }
 
     // Merge the best pair to merge, add new pairs that get formed as a
@@ -359,6 +440,9 @@ Status ClusterHistograms(const HistogramParams& params,
         continue;
       }
       (*out)[first].AddHistogram((*out)[second]);
+      if (use_bound) {
+        for (size_t i = 0; i < sketches[first].size(); ++i) sketches[first][i] += sketches[second][i];
+      }
       JXL_ASSIGN_OR_RETURN((*out)[first].entropy,
                            (*out)[first].ANSPopulationCost());
       for (uint32_t& item : renumbering) {
@@ -371,6 +455,11 @@ Status ClusterHistograms(const HistogramParams& params,
       for (uint32_t j = 0; j < out->size(); j++) {
         if (j == first) continue;
         if (version[j] == 0) continue;
+        if (use_bound && ClusterMergeLowerBound(sketches[first], sketches[j]) >=
+                            double((*out)[first].entropy) + (*out)[j].entropy) {
+          ++bounded_updates;
+          continue;
+        }
         Histogram histo;
         histo.AddHistogram((*out)[first]);
         histo.AddHistogram((*out)[j]);
@@ -394,6 +483,8 @@ Status ClusterHistograms(const HistogramParams& params,
     for (uint32_t& item : *histogram_symbols) {
       item = reverse_renumbering[renumbering[item]];
     }
+    refine.Set("bound_pairs", std::accumulate(bounded_rows.begin(), bounded_rows.end(), size_t{0}));
+    refine.Set("bound_updates", bounded_updates);
   }
 
   // Convert the context map to a canonical form.

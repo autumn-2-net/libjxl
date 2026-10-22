@@ -17,6 +17,7 @@
 namespace jxl {
 
 struct AuxOut;
+struct HistogramParams;
 enum class LayerType : uint8_t;
 
 // Max limit is 255 because encoding assumes numbers < 255
@@ -27,10 +28,11 @@ static const size_t kClustersLimit = 128;
 // histogram ids is given by num_histograms.
 Status EncodeContextMap(const std::vector<uint8_t>& context_map,
                         size_t num_histograms, BitWriter* writer,
-                        LayerType layer, AuxOut* aux_out);
+                        LayerType layer, AuxOut* aux_out,
+                        const HistogramParams* direct = nullptr);
 
 Status EncodeBlockCtxMap(const BlockCtxMap& block_ctx_map, BitWriter* writer,
-                         AuxOut* aux_out);
+                         AuxOut* aux_out, const HistogramParams* direct = nullptr);
 }  // namespace jxl
 
 #endif  // LIB_JXL_ENC_CONTEXT_MAP_H_

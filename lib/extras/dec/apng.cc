@@ -67,6 +67,7 @@ Status DecodeImageAPNG(const Span<const uint8_t> bytes,
 #include <array>
 #include <atomic>
 #include <csetjmp>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -713,6 +714,9 @@ void SetColorData(PackedPixelFile* ppf, uint8_t color_type, uint8_t bit_depth,
     // palette will actually be 8-bit regardless of the index bitdepth
     ppf->info.bits_per_sample = 8;
   }
+  ppf->lossless_color_bits = ppf->info.bits_per_sample;
+  ppf->lossless_alpha_bits = (alpha_channel_used || has_transparency)
+                                  ? ppf->info.bits_per_sample : 0;
   if (color_used) {
     ppf->info.num_color_channels = 3;
     ppf->color_encoding.color_space = JXL_COLOR_SPACE_RGB;
@@ -751,6 +755,35 @@ void SetColorData(PackedPixelFile* ppf, uint8_t color_type, uint8_t bit_depth,
   ppf->color_encoding.color_space = (ppf->info.num_color_channels == 1)
                                         ? JXL_COLOR_SPACE_GRAY
                                         : JXL_COLOR_SPACE_RGB;
+}
+
+uint32_t ExactSignificantBits(const PackedPixelFile& ppf, uint32_t stored_bits,
+                              uint32_t hint, size_t begin, size_t end) {
+  if (hint == 0 || hint >= stored_bits || stored_bits > 16) return stored_bits;
+  const uint32_t max_value = (1u << stored_bits) - 1;
+  const uint32_t hint_max = (1u << hint) - 1;
+  // Integer bit replication has an exact inverse. Other sBIT scalings may
+  // round away stored low bits, so retain their full precision conservatively.
+  if (max_value % hint_max != 0) return stored_bits;
+  const uint32_t step = max_value / hint_max;
+  for (const auto& frame : ppf.frames) {
+    const auto& image = frame.color;
+    if (end > image.format.num_channels) return stored_bits;
+    if ((stored_bits <= 8 && image.format.data_type != JXL_TYPE_UINT8) ||
+        (stored_bits > 8 && image.format.data_type != JXL_TYPE_UINT16)) {
+      return stored_bits;
+    }
+    for (size_t y = 0; y < image.ysize; ++y) {
+      for (size_t x = 0; x < image.xsize; ++x) {
+        for (size_t c = begin; c < end; ++c) {
+          const auto value = static_cast<uint32_t>(
+              std::round(image.GetPixelValue(y, x, c) * max_value));
+          if (value % step != 0) return stored_bits;
+        }
+      }
+    }
+  }
+  return hint;
 }
 
 // Color profile chunks: cICP has the highest priority, followed by
@@ -1302,6 +1335,12 @@ Status DecodeImageAPNG(const Span<const uint8_t> bytes,
 
   if (ppf->frames.empty()) return JXL_FAILURE("No frames decoded");
   ppf->frames.back().frame_info.is_last = JXL_TRUE;
+  ppf->lossless_color_bits = ExactSignificantBits(
+      *ppf, ppf->lossless_color_bits, ppf->info.bits_per_sample,
+      0, ppf->info.num_color_channels);
+  ppf->lossless_alpha_bits = ExactSignificantBits(
+      *ppf, ppf->lossless_alpha_bits, ppf->info.alpha_bits,
+      ppf->info.num_color_channels, ppf->info.num_color_channels + 1);
 
   return true;
 }

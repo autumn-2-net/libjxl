@@ -42,7 +42,8 @@ class ModularFrameEncoder {
  public:
   static StatusOr<std::unique_ptr<ModularFrameEncoder>> Create(
       JxlMemoryManager* memory_manager, const FrameHeader& frame_header,
-      const CompressParams& cparams_orig, bool streaming_mode);
+      const CompressParams& cparams_orig, bool streaming_mode,
+      bool jpeg_transcode = false);
   Status ComputeEncodingData(
       const FrameHeader& frame_header, const ImageMetadata& metadata,
       Image3F* JXL_RESTRICT color, const std::vector<ImageF>& extra_channels,
@@ -54,7 +55,7 @@ class ModularFrameEncoder {
   Status ComputeTokens(ThreadPool* pool);
   // Encodes global info (tree + histograms) in the `writer`.
   Status EncodeGlobalInfo(bool streaming_mode, BitWriter* writer,
-                          AuxOut* aux_out);
+                          AuxOut* aux_out, ThreadPool* pool = nullptr);
   // Encodes a specific modular image (identified by `stream`) in the `writer`,
   // assigning bits to the provided `layer`.
   Status EncodeStream(BitWriter* writer, AuxOut* aux_out, LayerType layer,
@@ -98,12 +99,15 @@ class ModularFrameEncoder {
  private:
   explicit ModularFrameEncoder(JxlMemoryManager* memory_manager);
   Status Init(const FrameHeader& frame_header,
-              const CompressParams& cparams_orig, bool streaming_mode);
+              const CompressParams& cparams_orig, bool streaming_mode,
+              bool jpeg_transcode);
 
   Status PrepareStreamParams(const Rect& rect, const CompressParams& cparams,
                              int minShift, int maxShift,
                              const ModularStreamId& stream, bool do_color,
-                             bool groupwise);
+                             bool groupwise, ThreadPool* wp_pool = nullptr,
+                             size_t* deferred_wp_modes = nullptr);
+  Status PrepareWPModes(const std::vector<size_t>& modes, ThreadPool* pool);
   JxlMemoryManager* memory_manager_;
   std::vector<Image> stream_images_;
   std::vector<ModularOptions> stream_options_;

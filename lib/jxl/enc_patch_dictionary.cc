@@ -4,6 +4,7 @@
 // license that can be found in the LICENSE file.
 
 #include "lib/jxl/enc_patch_dictionary.h"
+#include "lib/jxl/enc_final_plan.h"
 
 #include <jxl/cms_interface.h>
 #include <jxl/memory_manager.h>
@@ -14,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -38,6 +40,7 @@
 #include "lib/jxl/enc_debug_image.h"
 #include "lib/jxl/enc_dot_dictionary.h"
 #include "lib/jxl/enc_frame.h"
+#include "lib/jxl/enc_lossless_profile.h"
 #include "lib/jxl/enc_params.h"
 #include "lib/jxl/frame_header.h"
 #include "lib/jxl/image.h"
@@ -129,6 +132,7 @@ Status PatchDictionaryEncoder::Encode(const PatchDictionary& pdic,
 // static
 Status PatchDictionaryEncoder::SubtractFrom(const PatchDictionary& pdic,
                                             Image3F* opsin) {
+  LosslessProfileScope profile(LosslessProfileCurrent(), "patch.subtract");
   // TODO(veluca): this can likely be optimized knowing it runs on full images.
   for (size_t y = 0; y < opsin->ysize(); y++) {
     float* JXL_RESTRICT rows[3] = {
@@ -234,6 +238,28 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
     AuxOut* aux_out, bool is_xyb) {
   std::vector<PatchInfo> info;
   if (state->cparams.patches == Override::kOff) return info;
+  LosslessProfileScope profile(LosslessProfileCurrent(), "patch.detect");
+  const char* fast_value = std::getenv("JXL_LOSSLESS_PATCH_FAST");
+  const bool fast = cparams.IsLossless() && !is_xyb &&
+                    (!fast_value || std::strcmp(fast_value, "1") == 0);
+  size_t max_patch_side = kMaxPatchSize;
+  int min_peak = 2;
+  int fingerprint_divisor = 1;
+  if (cparams.IsLossless() && !is_xyb) {
+    const char* size = std::getenv("JXL_LOSSLESS_PATCH_MAX_SIZE");
+    if (size && std::strcmp(size, "64") == 0) max_patch_side = 64;
+    if (size && std::strcmp(size, "128") == 0) max_patch_side = 128;
+    const char* low_contrast = std::getenv("JXL_LOSSLESS_PATCH_LOW_CONTRAST");
+    if (low_contrast && std::strcmp(low_contrast, "1") == 0) min_peak = 1;
+    const char* fingerprint = std::getenv("JXL_LOSSLESS_PATCH_FINGERPRINT");
+    if (fingerprint && std::strcmp(fingerprint, "2") == 0) fingerprint_divisor = 2;
+    if (fingerprint && std::strcmp(fingerprint, "4") == 0) fingerprint_divisor = 4;
+  }
+  profile.Set("fast", fast);
+  profile.Set("max_patch_side", max_patch_side);
+  profile.Set("min_peak", min_peak);
+  profile.Set("fingerprint_divisor", fingerprint_divisor);
+  profile.Set("unique_patches", 0);
   const auto& frame_dim = state->shared.frame_dim;
   JxlMemoryManager* memory_manager = opsin.memory_manager();
 
@@ -277,6 +303,7 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
 
   // Look for kPatchSide size squares, naturally aligned, that all have the same
   // pixel values.
+  LosslessProfileScope seeds_profile(profile.Id(), "patch.seeds");
   JXL_ASSIGN_OR_RETURN(
       ImageB is_screenshot_like,
       ImageB::Create(memory_manager, DivCeil(frame_dim.xsize, kPatchSide),
@@ -332,6 +359,9 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
     JXL_RETURN_IF_ERROR(RunOnPool(pool, 1, ph - 2, ThreadPool::NoInit,
                                   process_row, "IsScreenshotLike"));
   }
+  seeds_profile.Set("seeds", screenshot_area_seeds.load());
+  seeds_profile.Set("pixels", frame_dim.xsize * frame_dim.ysize);
+  seeds_profile.Finish();
 
   // TODO(veluca): also parallelize the rest of this function.
   if (WantDebugOutput(cparams)) {
@@ -342,11 +372,15 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
   constexpr int kSearchRadius = 1;
 
   size_t num_seeds = screenshot_area_seeds.load();
+  profile.Set("seeds", num_seeds);
+  // Without a background seed, no connected component can have a border.
+  if (fast && num_seeds == 0) return info;
   if (!ApplyOverride(state->cparams.patches, (num_seeds > 0))) {
     return info;
   }
 
   // Search for "similar enough" pixels near the screenshot-like areas.
+  LosslessProfileScope background_profile(profile.Id(), "patch.background");
   JXL_ASSIGN_OR_RETURN(
       ImageB is_background,
       ImageB::Create(memory_manager, frame_dim.xsize, frame_dim.ysize));
@@ -368,24 +402,64 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
     return is_background_row[p.second * is_background_stride + p.first];
   };
   std::vector<std::pair<XY, XY>> queue;
-  queue.reserve(2 * num_seeds * kPatchSide * kPatchSide);
+  queue.reserve(fast ? std::min<size_t>(65536, num_seeds * kPatchSide * kPatchSide)
+                     : 2 * num_seeds * kPatchSide * kPatchSide);
   size_t queue_front = 0;
-  // TODO(eustas): coalesce neighbours, leave only border.
   if (can_have_seeds) {
     for (size_t py = 1; py < ph - 1; py++) {
       uint8_t* JXL_RESTRICT screenshot_row = is_screenshot_like.Row(py);
       for (size_t px = 1; px < pw - 1; px++) {
         if (!screenshot_row[px]) continue;
         for (size_t y = py * kPatchSide; y < (py + 1) * kPatchSide; ++y) {
+          if (fast) {
+            const size_t x = px * kPatchSide;
+            std::memset(is_background.Row(y) + x, 1, kPatchSide);
+            for (size_t c = 0; c < 3; ++c) {
+              std::memcpy(background_rows[c] + y * background_stride + x,
+                          opsin_rows[c] + y * opsin_stride + x,
+                          kPatchSide * sizeof(float));
+            }
+            continue;
+          }
           for (size_t x = px * kPatchSide; x < (px + 1) * kPatchSide; ++x) {
             XY p = {static_cast<uint32_t>(x), static_cast<uint32_t>(y)};
-            queue.emplace_back(p, p);
             is_bg(p) = 1;
+            queue.emplace_back(p, p);
           }
         }
       }
     }
   }
+  if (fast) {
+    // Interior seeds cannot expand: all eight neighbors are already marked.
+    // Preserve the original ordering of the remaining seeds for BFS ties.
+    for (size_t py = 1; py + 1 < ph; ++py) {
+      const uint8_t* above = is_screenshot_like.Row(py - 1);
+      const uint8_t* row = is_screenshot_like.Row(py);
+      const uint8_t* below = is_screenshot_like.Row(py + 1);
+      for (size_t px = 1; px + 1 < pw; ++px) {
+        if (!row[px]) continue;
+        if (above[px - 1] && above[px] && above[px + 1] && row[px - 1] &&
+            row[px + 1] && below[px - 1] && below[px] && below[px + 1]) {
+          continue;
+        }
+        for (size_t y = py * kPatchSide; y < (py + 1) * kPatchSide; ++y) {
+          for (size_t x = px * kPatchSide; x < (px + 1) * kPatchSide; ++x) {
+            bool interior = true;
+            for (int dy = -1; dy <= 1; ++dy) {
+              const uint8_t* bg_row = is_background.Row(y + dy);
+              interior &= bg_row[x - 1] && bg_row[x] && bg_row[x + 1];
+            }
+            if (!interior) {
+              XY p{static_cast<int32_t>(x), static_cast<int32_t>(y)};
+              queue.emplace_back(p, p);
+            }
+          }
+        }
+      }
+    }
+  }
+  background_profile.Set("initial_queue", queue.size());
   while (queue_front < queue.size()) {
     XY cur = queue[queue_front].first;
     XY src = queue[queue_front].second;
@@ -419,7 +493,10 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
       }
     }
   }
+  background_profile.Set("queue_pixels", queue.size());
+  background_profile.Set("queue_capacity", queue.capacity());
   queue.clear();
+  background_profile.Finish();
 
   ImageF ccs;
   Rng rng(0);
@@ -448,11 +525,11 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
                            kVerySimilarThreshold);
   };
 
-  constexpr int kMinPeak = 2;
   constexpr int kHasSimilarRadius = 2;
 
   // Find small CC outside the "similar enough" areas, compute bounding boxes,
   // and run heuristics to exclude some patches.
+  LosslessProfileScope components_profile(profile.Id(), "patch.components");
   JXL_ASSIGN_OR_RETURN(
       ImageB visited,
       ImageB::Create(memory_manager, frame_dim.xsize, frame_dim.ysize));
@@ -461,12 +538,18 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
   const size_t visited_stride = visited.PixelsPerRow();
   std::vector<std::pair<uint32_t, uint32_t>> cc;
   std::vector<std::pair<uint32_t, uint32_t>> stack;
+  size_t oversized = 0, no_border = 0, mixed_border = 0;
+  size_t low_peak = 0, quant_overflow = 0, candidate_pixels = 0;
   for (size_t y = 0; y < frame_dim.ysize; y++) {
     for (size_t x = 0; x < frame_dim.xsize; x++) {
-      if (is_background_row[y * is_background_stride + x]) continue;
+      if (is_background_row[y * is_background_stride + x] ||
+          (fast && visited_row[y * visited_stride + x])) {
+        continue;
+      }
       cc.clear();
       stack.clear();
       stack.emplace_back(static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+      if (fast) visited_row[y * visited_stride + x] = 1;
       size_t min_x = x;
       size_t max_x = x;
       size_t min_y = y;
@@ -477,8 +560,10 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
       while (!stack.empty()) {
         std::pair<uint32_t, uint32_t> cur = stack.back();
         stack.pop_back();
-        if (visited_row[cur.second * visited_stride + cur.first]) continue;
-        visited_row[cur.second * visited_stride + cur.first] = 1;
+        if (!fast) {
+          if (visited_row[cur.second * visited_stride + cur.first]) continue;
+          visited_row[cur.second * visited_stride + cur.first] = 1;
+        }
         if (cur.first < min_x) min_x = cur.first;
         if (cur.first > max_x) max_x = cur.first;
         if (cur.second < min_y) min_y = cur.second;
@@ -499,8 +584,18 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
             std::pair<uint32_t, uint32_t> next{next_first, next_second};
             if (!is_background_row[next.second * is_background_stride +
                                    next.first]) {
+              if (fast) {
+                uint8_t& seen =
+                    visited_row[next.second * visited_stride + next.first];
+                if (seen) continue;
+                seen = 1;
+              }
               stack.push_back(next);
             } else {
+              if (fast && (!all_similar || max_x - min_x >= max_patch_side ||
+                           max_y - min_y >= max_patch_side)) {
+                continue;
+              }
               if (!found_border) {
                 reference = next;
                 found_border = true;
@@ -511,8 +606,13 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
           }
         }
       }
-      if (!found_border || !all_similar || max_x - min_x >= kMaxPatchSize ||
-          max_y - min_y >= kMaxPatchSize) {
+      if (max_x - min_x >= max_patch_side || max_y - min_y >= max_patch_side) {
+        ++oversized;
+        continue;
+      }
+      if (!found_border || !all_similar) {
+        no_border += !found_border;
+        mixed_border += found_border && !all_similar;
         continue;
       }
       size_t bpos = background_stride * reference.second + reference.first;
@@ -536,7 +636,12 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
         }
       }
       if (!has_similar) continue;
-      info.emplace_back();
+      const size_t storage_pixels =
+          (fast || max_patch_side > kMaxPatchSize)
+              ? (max_x - min_x + 1) * (max_y - min_y + 1)
+              : kMaxPatchSize * kMaxPatchSize;
+      info.emplace_back(QuantizedPatch(storage_pixels),
+                        std::vector<std::pair<uint32_t, uint32_t>>());
       info.back().second.emplace_back(static_cast<uint32_t>(min_x),
                                       static_cast<uint32_t>(min_y));
       QuantizedPatch& patch = info.back().first;
@@ -552,16 +657,22 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
             patch.fpixels[c][offset] = fval;
             int val = pci.Quantize(patch.fpixels[c][offset], c);
             int8_t qval = static_cast<int8_t>(val);
-            patch.pixels[c][offset] = qval;
+            // Only the grouping key is coarsened. The reference keeps its
+            // original samples and all remaining differences are encoded.
+            patch.pixels[c][offset] =
+                static_cast<int8_t>(val / fingerprint_divisor);
             too_big |= (val != static_cast<int>(qval));
-            too_small &= (val < kMinPeak) && (val > -kMinPeak);
+            too_small &= (val < min_peak) && (val > -min_peak);
           }
         }
       }
       if (too_small || too_big) {
+        low_peak += too_small;
+        quant_overflow += too_big;
         info.pop_back();
         continue;
       }
+      candidate_pixels += patch.xsize * patch.ysize;
       if (paint_ccs) {
         float cc_color = rng.UniformF(0.5, 1.0);
         for (std::pair<uint32_t, uint32_t> p : cc) {
@@ -575,11 +686,20 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
     JXL_ENSURE(WantDebugOutput(cparams));
     JXL_RETURN_IF_ERROR(DumpPlaneNormalized(cparams, "ccs", ccs));
   }
+  components_profile.Set("candidate_patches", info.size());
+  components_profile.Set("candidate_pixels", candidate_pixels);
+  components_profile.Set("oversized", oversized);
+  components_profile.Set("no_border", no_border);
+  components_profile.Set("mixed_border", mixed_border);
+  components_profile.Set("low_peak", low_peak);
+  components_profile.Set("quant_overflow", quant_overflow);
+  components_profile.Finish();
   if (info.empty()) {
     return info;
   }
 
   // Remove duplicates.
+  LosslessProfileScope dedup_profile(profile.Id(), "patch.dedup");
   constexpr size_t kMinPatchOccurrences = 2;
   std::sort(info.begin(), info.end());
   size_t unique = 0;
@@ -591,7 +711,11 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
       if (info[unique].second.size() >= kMinPatchOccurrences) {
         unique++;
       }
-      info[unique] = info[i];
+      if (fast) {
+        if (unique != i) info[unique] = std::move(info[i]);
+      } else {
+        info[unique] = info[i];
+      }
     }
   }
   if (info[unique].second.size() >= kMinPatchOccurrences) {
@@ -611,6 +735,15 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
   if (max_patch_size < kMinMaxPatchSize) {
     info.clear();
   }
+  dedup_profile.Set("unique_patches", info.size());
+  profile.Set("unique_patches", info.size());
+  size_t patch_pixels = 0, occurrences = 0;
+  for (const auto& patch : info) {
+    occurrences += patch.second.size();
+    patch_pixels += patch.first.xsize * patch.first.ysize * patch.second.size();
+  }
+  profile.Set("occurrences", occurrences);
+  profile.Set("patch_pixels", patch_pixels);
 
   return info;
 }
@@ -621,6 +754,13 @@ Status FindBestPatchDictionary(const Image3F& opsin,
                                PassesEncoderState* JXL_RESTRICT state,
                                const JxlCmsInterface& cms, ThreadPool* pool,
                                AuxOut* aux_out, bool is_xyb) {
+  if (ReplayingFinalPlan()) {
+    std::vector<int64_t> v;
+    JXL_RETURN_IF_ERROR(FinalPlanExchange("patches", &v));
+    JXL_ENSURE(v.size() == 1 && v[0] == 0);
+    return true;
+  }
+  LosslessProfileScope profile(LosslessProfileCurrent(), "patch.total");
   JXL_ASSIGN_OR_RETURN(
       std::vector<PatchInfo> info,
       FindTextLikePatches(state->cparams, opsin, state, pool, aux_out, is_xyb));
@@ -642,8 +782,18 @@ Status FindBestPatchDictionary(const Image3F& opsin,
                                            state->shared.cmap.base(), pool));
   }
 
+  if (CurrentFinalPlan()) {
+    if (!info.empty()) {
+      CurrentFinalPlan()->unsupported = "patch reference capture";
+    } else {
+      std::vector<int64_t> v{0};
+      JXL_RETURN_IF_ERROR(FinalPlanExchange("patches", &v));
+    }
+  }
+  FinalPlanScope final_scope(info.empty() ? CurrentFinalPlan() : nullptr);
   if (info.empty()) return true;
 
+  LosslessProfileScope reference_profile(profile.Id(), "patch.reference_build");
   std::sort(
       info.begin(), info.end(), [&](const PatchInfo& a, const PatchInfo& b) {
         return a.first.xsize * a.first.ysize > b.first.xsize * b.first.ysize;
@@ -796,6 +946,9 @@ Status FindBestPatchDictionary(const Image3F& opsin,
     }
   }
 
+  reference_profile.Set("reference_pixels", ref_xsize * ref_ysize);
+  reference_profile.Set("positions", positions.size());
+  reference_profile.Finish();
   JXL_RETURN_IF_ERROR(RoundtripPatchFrame(&reference_frame, state,
                                           kPatchFrameReferenceId, cparams, cms,
                                           pool, aux_out, /*subtract=*/true));
@@ -854,9 +1007,12 @@ Status RoundtripPatchFrame(Image3F* reference_frame,
   }
   auto special_frame = jxl::make_unique<BitWriter>(memory_manager);
   AuxOut patch_aux_out;
+  LosslessProfileScope encode_profile(LosslessProfileCurrent(),
+                                      "patch.reference_encode");
   JXL_RETURN_IF_ERROR(EncodeFrame(
       memory_manager, cparams, patch_frame_info, state->shared.metadata, ib,
       cms, pool, special_frame.get(), aux_out ? &patch_aux_out : nullptr));
+  encode_profile.Finish();
   if (aux_out) {
     for (const auto& l : patch_aux_out.layers) {
       aux_out->layer(LayerType::Dictionary).Assimilate(l);
@@ -865,6 +1021,8 @@ Status RoundtripPatchFrame(Image3F* reference_frame,
   const Span<const uint8_t> encoded = special_frame->GetSpan();
   state->special_frames.emplace_back(std::move(special_frame));
   if (subtract) {
+    LosslessProfileScope decode_profile(LosslessProfileCurrent(),
+                                        "patch.reference_decode");
     ImageBundle decoded(memory_manager, &state->shared.metadata->m);
     auto dec_state = jxl::make_unique<PassesDecoderState>(memory_manager);
     JXL_RETURN_IF_ERROR(dec_state->output_encoding_info.SetFromMetadata(

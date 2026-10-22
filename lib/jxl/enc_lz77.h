@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <vector>
 
+#include "lib/jxl/base/status.h"
 #include "lib/jxl/dec_ans.h"
 #include "lib/jxl/enc_ans.h"
 #include "lib/jxl/enc_ans_params.h"
@@ -18,7 +19,7 @@ namespace jxl {
 // Returns a vector of token streams with the LZ77 compression applied
 // in accordance with parameters sent. If compression is not beneficial,
 // returns an empty vector.
-std::vector<std::vector<Token>> ApplyLZ77(
+StatusOr<std::vector<std::vector<Token>>> ApplyLZ77(
     const HistogramParams& params, size_t num_contexts,
     const std::vector<std::vector<Token>>& tokens, const LZ77Params& lz77);
 

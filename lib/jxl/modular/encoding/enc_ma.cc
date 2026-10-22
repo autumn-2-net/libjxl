@@ -6,6 +6,7 @@
 #include "lib/jxl/modular/encoding/enc_ma.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -15,16 +16,24 @@
 #include <limits>
 #include <numeric>
 #include <queue>
+#include <type_traits>
 #include <vector>
 
 #include "lib/jxl/ans_params.h"
 #include "lib/jxl/base/bits.h"
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/compiler_specific.h"
+#include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/base/printf_macros.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/dec_ans.h"
+#include "lib/jxl/enc_lossless_profile.h"
+#include "lib/jxl/enc_lossless_probe_pool.h"
 #include "lib/jxl/modular/encoding/dec_ma.h"
+#include "lib/jxl/modular/encoding/enc_ma_histograms.h"
+#include "lib/jxl/modular/encoding/enc_ma_entropy.h"
+#include "lib/jxl/modular/encoding/enc_ma_racing.h"
+#include "lib/jxl/enc_lossless_workers.h"
 #include "lib/jxl/modular/encoding/ma_common.h"
 #include "lib/jxl/modular/modular_image.h"
 
@@ -88,11 +97,13 @@ constexpr uint32_t kEntropyTableMaxCount = 256;
 // Most tree nodes have few samples. Reuse the exact SIMD expression rather
 // than approximating entropy or changing its floating-point reduction order.
 const float* SmallHistogramEntropy(uint32_t total) {
-  if (total > kEntropyTableMaxCount) return nullptr;
+  static const uint32_t limit = LosslessWorkerSetting(
+      std::getenv("JXL_MA_ENTROPY_TABLE_LIMIT"), kEntropyTableMaxCount, 4096);
+  if (total > limit) return nullptr;
   static const std::vector<float> table = [] {
     std::vector<float> values(
-        (kEntropyTableMaxCount + 1) * (kEntropyTableMaxCount + 2) / 2 + Lanes(df));
-    for (uint32_t n = 1; n <= kEntropyTableMaxCount; ++n) {
+        (limit + 1) * (limit + 2) / 2 + Lanes(df));
+    for (uint32_t n = 1; n <= limit; ++n) {
       const auto total_v = Set(di, static_cast<int32_t>(n));
       const auto inv_total = Set(df, 1.0f / n);
       const auto minprob = Set(df, 1.0f / ANS_TAB_SIZE);
@@ -129,11 +140,12 @@ HWY_INLINE auto EntropyContribution(decltype(Zero(di)) counts,
 // The weighted sample totals depend only on the property split, not on the
 // predictor. Update both histograms and evaluate them in one pass, preserving
 // EstimateBits' floating-point operations and per-side lane accumulation order.
-template <bool kLookupAbove, bool kLookupBelow>
+template <bool kLookupAbove, bool kLookupBelow, bool kSparse>
 void MoveCountsAndEstimateBitsImpl(
     int32_t* above, int32_t* below, int32_t* increase, size_t num_symbols,
     uint32_t total_above, uint32_t total_below, const float* table_above,
-    const float* table_below, float* bits_above, float* bits_below) {
+    const float* table_below, const size_t* blocks, size_t num_blocks,
+    float* bits_above, float* bits_below) {
   JXL_DASSERT(num_symbols == Padded(num_symbols));
   const auto total_r = Set(di, static_cast<int32_t>(total_above));
   const auto total_l = Set(di, static_cast<int32_t>(total_below));
@@ -141,7 +153,9 @@ void MoveCountsAndEstimateBitsImpl(
   const auto inv_l = Set(df, 1.0f / GetLane(total_l));
   auto bits_r = Zero(df);
   auto bits_l = Zero(df);
-  for (size_t i = 0; i < num_symbols; i += Lanes(di)) {
+  const size_t iterations = kSparse ? num_blocks : num_symbols / Lanes(di);
+  for (size_t block = 0; block < iterations; ++block) {
+    const size_t i = kSparse ? blocks[block] : block * Lanes(di);
     const auto delta = LoadU(di, increase + i);
     const auto r = Sub(LoadU(di, above + i), delta);
     const auto l = Add(LoadU(di, below + i), delta);
@@ -157,32 +171,59 @@ void MoveCountsAndEstimateBitsImpl(
   *bits_below = GetLane(SumOfLanes(df, bits_l));
 }
 
+template <bool kSparse>
 void MoveCountsAndEstimateBits(int32_t* above, int32_t* below, int32_t* increase,
                                size_t num_symbols, uint32_t total_above,
-                               uint32_t total_below, float* bits_above,
+                               uint32_t total_below, const size_t* blocks,
+                               size_t num_blocks, float* bits_above,
                                float* bits_below) {
   const float* table_above = SmallHistogramEntropy(total_above);
   const float* table_below = SmallHistogramEntropy(total_below);
   if (table_above && table_below) {
-    MoveCountsAndEstimateBitsImpl<true, true>(
+    MoveCountsAndEstimateBitsImpl<true, true, kSparse>(
         above, below, increase, num_symbols, total_above, total_below,
-        table_above, table_below, bits_above, bits_below);
+        table_above, table_below, blocks, num_blocks, bits_above, bits_below);
   } else if (table_above) {
-    MoveCountsAndEstimateBitsImpl<true, false>(
+    MoveCountsAndEstimateBitsImpl<true, false, kSparse>(
         above, below, increase, num_symbols, total_above, total_below,
-        table_above, table_below, bits_above, bits_below);
+        table_above, table_below, blocks, num_blocks, bits_above, bits_below);
   } else if (table_below) {
-    MoveCountsAndEstimateBitsImpl<false, true>(
+    MoveCountsAndEstimateBitsImpl<false, true, kSparse>(
         above, below, increase, num_symbols, total_above, total_below,
-        table_above, table_below, bits_above, bits_below);
+        table_above, table_below, blocks, num_blocks, bits_above, bits_below);
   } else {
-    MoveCountsAndEstimateBitsImpl<false, false>(
+    MoveCountsAndEstimateBitsImpl<false, false, kSparse>(
         above, below, increase, num_symbols, total_above, total_below,
-        nullptr, nullptr, bits_above, bits_below);
+        nullptr, nullptr, blocks, num_blocks, bits_above, bits_below);
   }
 }
 
 constexpr uint32_t kCountEntropyTableSize = 65536;
+
+// Cache log(count), not log(count / total), so larger histograms can reuse a
+// small one-dimensional table. The probability floor is unchanged; floating
+// point rounding may select a different valid tree.
+void MoveCountsAndLogBits(int32_t* above, int32_t* below, int32_t* increase,
+                          size_t symbols, uint32_t total_above,
+                          uint32_t total_below, const float* logs,
+                          float* bits_above, float* bits_below) {
+  const auto lr = Set(df, logs[total_above]);
+  const auto ll = Set(df, logs[total_below]);
+  const auto cap = Set(df, float{ANS_LOG_TAB_SIZE});
+  auto br = Zero(df), bl = Zero(df);
+  for (size_t s = 0; s < symbols; s += Lanes(di)) {
+    const auto delta = LoadU(di, increase + s);
+    const auto r = Sub(LoadU(di, above + s), delta);
+    const auto l = Add(LoadU(di, below + s), delta);
+    StoreU(r, di, above + s);
+    StoreU(l, di, below + s);
+    StoreU(Zero(di), di, increase + s);
+    br = Add(br, Mul(ConvertTo(df, r), Min(cap, Sub(lr, GatherIndex(df, logs, r)))));
+    bl = Add(bl, Mul(ConvertTo(df, l), Min(cap, Sub(ll, GatherIndex(df, logs, l)))));
+  }
+  *bits_above = GetLane(SumOfLanes(df, br));
+  *bits_below = GetLane(SumOfLanes(df, bl));
+}
 
 const double* CountEntropyTable() {
   static const std::vector<double> table = [] {
@@ -277,9 +318,11 @@ IntersectionType BoxIntersects(StaticPropRange needle, StaticPropRange haystack,
   return partial ? IntersectionType::kPartial : IntersectionType::kInside;
 }
 
-template<bool S>
+template<bool S, bool kBatch = false>
 void SplitTreeSamples(TreeSamples &tree_samples, size_t begin, size_t pos,
                       size_t end, size_t prop, uint32_t val) {
+  std::array<size_t, 128> left, right;
+  size_t buffered = 0;
   size_t begin_pos = begin;
   size_t end_pos = pos;
   do {
@@ -291,143 +334,489 @@ void SplitTreeSamples(TreeSamples &tree_samples, size_t begin, size_t pos,
       ++end_pos;
     }
     if (begin_pos < pos && end_pos < end) {
-      tree_samples.Swap(begin_pos, end_pos);
+      if constexpr (kBatch) {
+        // Scanned positions are disjoint, so postponing these swaps cannot
+        // change any later partition predicate or the resulting permutation.
+        left[buffered] = begin_pos;
+        right[buffered] = end_pos;
+        if (++buffered == left.size()) {
+          tree_samples.SwapBatch(left.data(), right.data(), buffered);
+          buffered = 0;
+        }
+      } else {
+        tree_samples.Swap(begin_pos, end_pos);
+      }
     }
     ++begin_pos;
     ++end_pos;
   } while (begin_pos < pos && end_pos < end);
+  if constexpr (kBatch) {
+    tree_samples.SwapBatch(left.data(), right.data(), buffered);
+  }
 }
 
-template <bool S>
+template <bool S, bool kCompact = false, bool kPropertyBins = false>
 void CollectExtraBitsIncrease(TreeSamples &tree_samples,
                               const std::vector<ResidualToken> &rtokens,
                               std::vector<int> &count_increase,
                               std::vector<size_t> &extra_bits_increase,
                               size_t begin, size_t end, size_t prop_idx,
-                              size_t max_symbols) {
+                              size_t max_symbols, const uint8_t* mapping = nullptr,
+                              const uint32_t* property_mapping = nullptr) {
   for (size_t i2 = begin; i2 < end; i2++) {
     const ResidualToken &rt = rtokens[i2];
     size_t cnt = tree_samples.Count(i2);
     size_t p = tree_samples.Property<S>(prop_idx, i2);
-    size_t sym = rt.tok;
+    if constexpr (kPropertyBins) p = property_mapping[p];
+    size_t sym = kCompact ? mapping[rt.tok] : rt.tok;
     size_t ebi = rt.nbits * cnt;
     count_increase[p * max_symbols + sym] += cnt;
     extra_bits_increase[p] += ebi;
   }
 }
 
-void FindBestSplit(TreeSamples &tree_samples, float threshold,
+Status FindBestSplitImpl(TreeSamples &tree_samples, float threshold,
                    const std::vector<ModularMultiplierInfo> &mul_info,
                    StaticPropRange initial_static_prop_range,
-                   float fast_decode_multiplier, Tree *tree) {
+                   float fast_decode_multiplier, Tree *tree, ThreadPool *pool,
+                   size_t sample_begin, size_t sample_end,
+                   std::vector<uint8_t> initial_redundant, bool subtree,
+                   uint64_t profile_context) {
   using Clock = std::chrono::steady_clock;
   const char* trace_value = std::getenv("JXL_LOSSLESS_MA_TRACE");
-  const bool trace = tree_samples.LosslessSpeedups() &&
+  const bool trace = !subtree && tree_samples.LosslessSpeedups() &&
                      tree_samples.NumDistinctSamples() >= 65536 &&
                      trace_value && std::strcmp(trace_value, "1") == 0;
-  const auto start = trace ? Clock::now() : Clock::time_point{};
+  LosslessProfileScope profile(profile_context,
+                              subtree ? "ma.subtree" : "ma.find_best_split");
+  const char* speculate_env = std::getenv("JXL_MA_SPECULATION_TRACE");
+  const bool speculation_trace = profile.Enabled() && !subtree &&
+      tree_samples.LosslessSpeedups() && speculate_env &&
+      std::strcmp(speculate_env, "1") == 0;
+  struct SpeculationStats {
+    uint64_t attempts = 0, hits = 0, lead_ns = 0, hit_lead_ns = 0;
+    uint64_t max_hit_lead_ns = 0;
+  };
+  std::array<SpeculationStats, 3> speculation;
+  size_t speculation_nodes = 0;
+  profile.Set("lossless_speedups", tree_samples.LosslessSpeedups());
+  profile.Set("fast_entropy", tree_samples.FastEntropy());
+  const char* mdl_env = std::getenv("JXL_MA_DESCRIPTION_COST");
+  const float mdl_weight = tree_samples.LosslessSpeedups() && mdl_env &&
+      mdl_env[0] >= '1' && mdl_env[0] <= '3' && mdl_env[1] == '\0'
+      ? (mdl_env[0] == '1' ? 0.25f : mdl_env[0] == '2' ? 0.5f : 1.0f) : 0;
+  profile.Set("description_weight_milli", static_cast<uint64_t>(mdl_weight * 1000));
+  const auto description_cost = [&](const int32_t* counts, size_t symbols,
+                                     uint32_t count) {
+    if (!mdl_weight) return 0.0f;
+    size_t active = 0;
+    for (size_t i = 0; i < symbols; ++i) active += counts[i] != 0;
+    // Finite-sample model-complexity penalty. It influences encoder learning
+    // only; the resulting tree and entropy models use the standard syntax.
+    return active > 1 ? mdl_weight * 0.5f * (active - 1) *
+                           FastLog2f(static_cast<float>(count) + 1) : 0.0f;
+  };
+  const char* partition_env = std::getenv("JXL_MA_BATCH_PARTITION");
+  const bool batch_partition = tree_samples.LosslessSpeedups() &&
+      (!partition_env || std::strcmp(partition_env, "1") == 0);
+  profile.Set("batch_partition", batch_partition);
+  uint64_t batch_partition_nodes = 0;
+  const char* fused_env = std::getenv("JXL_MA_FUSED_HISTOGRAM");
+  const char* multi_env = std::getenv("JXL_MA_MULTI_FUSED_HISTOGRAM");
+  const bool multi_fused = !multi_env || std::strcmp(multi_env, "1") == 0;
+  const bool fused_histogram =
+      tree_samples.LosslessSpeedups() &&
+      (tree_samples.NumPredictors() == 2 ||
+       (multi_fused && tree_samples.NumPredictors() > 2)) &&
+      (!fused_env || std::strcmp(fused_env, "1") == 0);
+  profile.Set("fused_histogram", fused_histogram);
+  const char* pred_dedup_env = std::getenv("JXL_MA_PREDICTOR_DEDUP");
+  const bool predictor_dedup = tree_samples.LosslessSpeedups() &&
+      tree_samples.NumPredictors() > 2 && pred_dedup_env &&
+      std::strcmp(pred_dedup_env, "1") == 0;
+  uint64_t equivalent_predictors = 0;
+  const char* padding_env = std::getenv("JXL_MA_PADDED_HISTOGRAM");
+  const bool padded_histogram = tree_samples.LosslessSpeedups() && padding_env &&
+      std::strcmp(padding_env, "1") == 0;
+  uint64_t padded_nodes = 0;
+  const auto histogram_stride = [&](size_t symbols) {
+    const size_t stride = Padded(symbols);
+    // Avoid mapping common low residuals from every property bucket to a small
+    // subset of cache sets. Keep the stride monotonic and SIMD-aligned.
+    if (padded_histogram && stride >= 32 && stride < 256 &&
+        (stride & (stride - 1)) == 0) {
+      ++padded_nodes;
+      return stride + Lanes(di);
+    }
+    return stride;
+  };
+  uint64_t fused_pair_samples = 0;
+  const char* trim_env = std::getenv("JXL_MA_TRIM_ENTROPY");
+  const bool trim_entropy = tree_samples.LosslessSpeedups() &&
+      !tree_samples.FastEntropy() && (!trim_env || std::strcmp(trim_env, "1") == 0);
+  profile.Set("trim_entropy", trim_entropy);
+  uint64_t entropy_tail_lanes_saved = 0;
+  const char* sparse_env = std::getenv("JXL_MA_SPARSE_ENTROPY");
+  const bool sparse_entropy = tree_samples.LosslessSpeedups() &&
+      !tree_samples.FastEntropy() && sparse_env && std::strcmp(sparse_env, "1") == 0;
+  profile.Set("sparse_entropy", sparse_entropy);
+  const char* shards_env = std::getenv("JXL_MA_HISTOGRAM_SHARDS");
+  const bool use_shards = tree_samples.LosslessSpeedups() && shards_env &&
+                         std::strcmp(shards_env, "4") == 0;
+  profile.Set("histogram_shards", use_shards ? 4 : 1);
+  const bool measure = trace || profile.Enabled();
+  const char* log_table_env = std::getenv("JXL_MA_COUNT_LOG_TABLE");
+  const float* count_logs = tree_samples.LosslessSpeedups() && log_table_env &&
+      std::strcmp(log_table_env, "1") == 0 ? MaCountLogTable() : nullptr;
+  const auto start = measure ? Clock::now() : Clock::time_point{};
   double histogram_seconds = 0, entropy_seconds = 0;
+  double partition_seconds = 0;
+  const char* parent_env = std::getenv("JXL_MA_PARENT_HISTOGRAM");
+  const char* reuse_parent_env = std::getenv("JXL_MA_PARENT_REUSE");
+  const bool reuse_parent = tree_samples.LosslessSpeedups() && reuse_parent_env &&
+      std::strcmp(reuse_parent_env, "1") == 0;
+  const bool fused_parent = tree_samples.LosslessSpeedups() && (reuse_parent ||
+                            (parent_env && std::strcmp(parent_env, "1") == 0));
+  profile.Set("fused_parent_histogram", fused_parent);
+  profile.Set("parent_reuse", reuse_parent);
+  uint64_t parent_reused_nodes = 0, parent_subtracted_samples = 0;
+  double leaf_histogram_seconds = 0, parent_histogram_seconds = 0;
+  uint64_t parent_parallel_nodes = 0, parent_sample_visits = 0;
+  uint64_t nodes_visited = 0, histogram_passes = 0, histogram_samples = 0;
+  const char* compact_env = std::getenv("JXL_MA_COMPACT_HISTOGRAM");
+  const bool compact_histograms = tree_samples.LosslessSpeedups() &&
+      !tree_samples.FastEntropy() &&
+      (!compact_env || std::strcmp(compact_env, "1") == 0);
+  const char* dense_env = std::getenv("JXL_MA_DENSE_HISTOGRAM");
+  const bool dense_histograms = compact_histograms && dense_env &&
+      (std::strcmp(dense_env, "1") == 0 || std::strcmp(dense_env, "2") == 0);
+  const size_t compact_limit = dense_histograms && dense_env[0] == '2' ? 4096 : 256;
+  profile.Set("dense_histograms", dense_histograms);
+  const char* bins_env = std::getenv("JXL_MA_PROPERTY_BINS");
+  const bool sparse_property_bins = bins_env && std::strcmp(bins_env, "2") == 0;
+  const bool compact_property_bins = tree_samples.LosslessSpeedups() && bins_env &&
+      (std::strcmp(bins_env, "1") == 0 || sparse_property_bins);
+  uint64_t compact_nodes = 0, compact_slots_saved = 0;
+  uint64_t threshold_evaluations = 0;
+  uint64_t entropy_blocks_saved = 0;
+  uint64_t sharded_samples = 0;
+  uint64_t cache_hits = 0, cache_saved_samples = 0;
+  const char* cache_env = std::getenv("JXL_MA_HISTOGRAM_CACHE");
+  const bool use_cache = tree_samples.LosslessSpeedups() &&
+                         (!cache_env || std::strcmp(cache_env, "1") == 0);
+  const char* paired_cache_env = std::getenv("JXL_MA_PAIRED_CACHE");
+  const bool paired_cache = fused_histogram && use_cache && paired_cache_env &&
+      std::strcmp(paired_cache_env, "1") == 0;
+  const char* property_env = std::getenv("JXL_MA_PROPERTY_CACHE");
+  const bool property_cache = use_cache &&
+      (!property_env || std::strcmp(property_env, "1") == 0);
+  uint64_t property_cache_hits = 0, property_saved_samples = 0;
+  const char* dedup_property_env = std::getenv("JXL_MA_PROPERTY_DEDUP");
+  const bool dedup_properties = tree_samples.LosslessSpeedups() &&
+      dedup_property_env && std::strcmp(dedup_property_env, "1") == 0;
+  profile.Set("property_dedup", dedup_properties);
+  uint64_t duplicate_properties = 0, duplicate_histogram_samples = 0;
+  const char* race_env = std::getenv("JXL_MA_STATISTICAL_RACE");
+  const bool statistical_race = tree_samples.LosslessSpeedups() && race_env &&
+      std::strcmp(race_env, "1") == 0;
+  uint64_t race_nodes = 0, race_draws = 0, race_pruned = 0;
+  double race_seconds = 0;
+  uint64_t constant_properties = 0, inherited_properties = 0;
+  MaHistogramBudget cache_budget;
   const double* entropy_table = tree_samples.FastEntropy() ? CountEntropyTable()
                                                           : nullptr;
+  const char* clipped_env = std::getenv("JXL_MA_CLIPPED_ENTROPY");
+  const bool clipped_entropy = tree_samples.LosslessSpeedups() &&
+      !tree_samples.FastEntropy() && clipped_env && clipped_env[0] >= '1' &&
+      clipped_env[0] <= '5' && clipped_env[1] == '\0';
+  const double* clipped_table = clipped_entropy ? CountEntropyTable() : nullptr;
+  profile.Set("clipped_entropy", clipped_entropy);
+  const char* refinement_env = std::getenv("JXL_MA_REFINE_QUANTILES");
+  const bool refine_quantiles = tree_samples.LosslessSpeedups() &&
+      !tree_samples.FastEntropy() && !clipped_entropy && refinement_env &&
+      std::strcmp(refinement_env, "1") == 0;
+  const char* quantile_env = std::getenv("JXL_MA_QUANTILE_SPLITS");
+  const size_t quantile_splits = refine_quantiles ? 32 : tree_samples.LosslessSpeedups() &&
+      !tree_samples.FastEntropy() && !clipped_entropy && quantile_env &&
+      (quantile_env[0] == '1' || quantile_env[0] == '2') && quantile_env[1] == '\0'
+      ? (quantile_env[0] == '1' ? 64 : 32) : 0;
+  profile.Set("quantile_splits", quantile_splits);
+  profile.Set("refine_quantiles", refine_quantiles);
   struct NodeInfo {
     size_t pos;
     size_t begin;
     size_t end;
     StaticPropRange static_prop_range;
+    std::unique_ptr<MaHistogramCache> histograms;
+    size_t removed_begin = 0;
+    size_t removed_end = 0;
+    std::vector<uint8_t> redundant_properties;
+    std::vector<MaParentHistogram> parents;
   };
   std::vector<NodeInfo> nodes;
-  nodes.push_back(NodeInfo{0, 0, tree_samples.NumDistinctSamples(),
+  nodes.push_back(NodeInfo{0, sample_begin, sample_end,
                            initial_static_prop_range});
+  nodes.back().redundant_properties = std::move(initial_redundant);
+  const char* subtrees_env = std::getenv("JXL_MA_SUBTREE_PARALLEL");
+  const char* small_subtrees_env = std::getenv("JXL_MA_SMALL_SUBTREES");
+  const size_t subtree_minimum = small_subtrees_env &&
+      std::strcmp(small_subtrees_env, "1") == 0 ? 8192 : 65536;
+  const bool parallel_subtrees = !subtree && pool &&
+      tree_samples.LosslessSpeedups() && sample_end - sample_begin >= subtree_minimum &&
+      subtrees_env && std::strcmp(subtrees_env, "1") == 0;
+  const char* balanced_env = std::getenv("JXL_MA_SUBTREE_BALANCED");
+  const bool balanced_subtrees = parallel_subtrees && balanced_env &&
+      std::strcmp(balanced_env, "1") == 0;
+  struct SubtreeJob {
+    size_t destination, begin, end;
+    StaticPropRange range;
+    std::vector<uint8_t> redundant;
+    Tree tree;
+  };
+  std::vector<SubtreeJob> subtrees;
 
   size_t num_predictors = tree_samples.NumPredictors();
   size_t num_properties = tree_samples.NumProperties();
   std::vector<int32_t> parent_counts(tree_samples.LosslessSpeedups() ? Padded(256)
                                                                    : 0);
+  std::vector<MaParentHistogram> parent_histograms(fused_parent ? num_predictors
+                                                               : 0);
 
-  // TODO(veluca): consider parallelizing the search (processing multiple nodes
-  // at a time).
+  struct SplitInfo {
+    size_t prop = 0;
+    uint32_t val = 0;
+    size_t pos = 0;
+    float lcost = std::numeric_limits<float>::max();
+    float rcost = std::numeric_limits<float>::max();
+    Predictor lpred = Predictor::Zero;
+    Predictor rpred = Predictor::Zero;
+    float Cost() const { return lcost + rcost; }
+  };
+  struct CostInfo {
+    float cost = std::numeric_limits<float>::max();
+    float extra_cost = 0;
+    Predictor pred = Predictor::Zero;
+    float Cost() const { return cost + extra_cost; }
+  };
+  struct PropertyWorkspace {
+    std::vector<int> used_count, count_increase, paired_counts;
+    std::vector<uint32_t> weight;
+    std::vector<uint32_t> property_bins;
+    std::vector<size_t> extra_bits_increase, paired_extra;
+    std::vector<CostInfo> costs_l, costs_r;
+    std::vector<int32_t> counts_above, counts_below;
+    MaHistogramShards histogram_shards;
+    double histogram_seconds = 0, entropy_seconds = 0;
+    uint64_t histogram_passes = 0, histogram_samples = 0;
+    uint64_t threshold_evaluations = 0, entropy_blocks_saved = 0;
+    uint64_t sharded_samples = 0, cache_hits = 0, cache_saved_samples = 0;
+    uint64_t fused_pair_samples = 0, entropy_tail_lanes_saved = 0;
+    uint64_t duplicate_properties = 0, duplicate_histogram_samples = 0;
+    uint64_t constant_properties = 0, inherited_properties = 0;
+    uint64_t property_cache_hits = 0, property_saved_samples = 0;
+    uint64_t paired_cache_samples = 0;
+    uint64_t property_bins_compacted = 0, property_slots_saved = 0;
+  };
+  // Scratch is owned by a worker, results by a property. Cache storage is
+  // allocated before dispatch and each task only writes its property's slice.
+  std::vector<PropertyWorkspace> workspaces(1);
+  std::vector<std::array<SplitInfo, 4>> property_splits(num_properties);
+  size_t worker_slots = 1;
+  bool pool_initialized = false;
+  uint64_t parallel_nodes = 0, parallel_properties = 0;
+  double parallel_seconds = 0;
+  const auto init_workers = [&](size_t threads) -> Status {
+    worker_slots = threads;
+    // A custom runner may report fewer workers for the predictor task range.
+    // Keep counters belonging to workers used by earlier Property dispatches.
+    if (workspaces.size() < threads) workspaces.resize(threads);
+    pool_initialized = true;
+    return true;
+  };
+
   while (!nodes.empty()) {
+    if (profile.Enabled()) ++nodes_visited;
     size_t pos = nodes.back().pos;
     size_t begin = nodes.back().begin;
     size_t end = nodes.back().end;
 
     StaticPropRange static_prop_range = nodes.back().static_prop_range;
+    auto cache = std::move(nodes.back().histograms);
+    const size_t removed_begin = nodes.back().removed_begin;
+    const size_t removed_end = nodes.back().removed_end;
+    auto redundant_properties = std::move(nodes.back().redundant_properties);
+    auto known_histograms = std::move(nodes.back().parents);
     nodes.pop_back();
     if (begin == end) continue;
-
-    struct SplitInfo {
-      size_t prop = 0;
-      uint32_t val = 0;
-      size_t pos = 0;
-      float lcost = std::numeric_limits<float>::max();
-      float rcost = std::numeric_limits<float>::max();
-      Predictor lpred = Predictor::Zero;
-      Predictor rpred = Predictor::Zero;
-      float Cost() const { return lcost + rcost; }
-    };
+    const size_t subtree_grain = balanced_subtrees && pool_initialized
+        ? std::max<size_t>(1024, std::min<size_t>(65536,
+            (sample_end - sample_begin) / (4 * worker_slots))) : 65536;
+    if (parallel_subtrees && pool_initialized && worker_slots > 1 &&
+        end - begin <= subtree_grain) {
+      // A parent cache can still reference samples in the sibling's range.
+      // Discard it before either range is mutated by independent workers.
+      subtrees.push_back(SubtreeJob{pos, begin, end, static_prop_range,
+                                    std::move(redundant_properties),
+                                    Tree{(*tree)[pos]}});
+      continue;
+    }
+    const bool known_parent = !known_histograms.empty();
+    if (known_parent) {
+      parent_histograms.swap(known_histograms);
+      ++parent_reused_nodes;
+    }
 
     SplitInfo best_split_static_constant;
     SplitInfo best_split_static;
     SplitInfo best_split_nonstatic;
     SplitInfo best_split_nowp;
+    std::vector<uint64_t> property_finished;
 
     JXL_DASSERT(begin <= end);
     JXL_DASSERT(end <= tree_samples.NumDistinctSamples());
 
     float base_bits = 0;
+    const size_t leaf_pred = tree_samples.PredictorIndex((*tree)[pos].predictor);
     if (tree_samples.LosslessSpeedups()) {
+      const auto before = measure ? Clock::now() : Clock::time_point{};
       // Leaf termination only needs the current predictor. Do not build all
       // predictor histograms for a node that cannot be split anyway.
-      const size_t pred = tree_samples.PredictorIndex((*tree)[pos].predictor);
-      std::fill(parent_counts.begin(), parent_counts.end(), 0);
       size_t parent_symbols = 0;
       size_t parent_extra_bits = 0;
       uint32_t parent_count = 0;
-      const auto& tokens = tree_samples.RTokens(pred);
-      for (size_t i = begin; i < end; ++i) {
-        const auto& token = tokens[i];
-        const size_t count = tree_samples.Count(i);
-        parent_counts[token.tok] += count;
-        parent_count += count;
-        parent_symbols = std::max(parent_symbols, size_t{token.tok} + 1);
-        parent_extra_bits += token.nbits * count;
+      const int32_t* leaf_counts = parent_counts.data();
+      if (fused_parent) {
+        auto& h = parent_histograms[leaf_pred];
+        if (!known_parent) CollectMaParentHistogram(tree_samples, leaf_pred, begin, end, &h);
+        leaf_counts = h.counts.data();
+        parent_symbols = h.symbols;
+        parent_extra_bits = h.extra_bits;
+        parent_count = h.weight;
+      } else {
+        std::fill(parent_counts.begin(), parent_counts.end(), 0);
+        const auto& tokens = tree_samples.RTokens(leaf_pred);
+        for (size_t i = begin; i < end; ++i) {
+          const auto& token = tokens[i];
+          const size_t count = tree_samples.Count(i);
+          parent_counts[token.tok] += count;
+          parent_count += count;
+          parent_symbols = std::max(parent_symbols, size_t{token.tok} + 1);
+          parent_extra_bits += token.nbits * count;
+        }
       }
       base_bits = entropy_table
                       ? std::max(0.0, CountEntropy(parent_count, entropy_table) -
                                           HistogramCountEntropy(
-                                              parent_counts.data(), parent_symbols,
+                                              leaf_counts, parent_symbols,
                                               entropy_table))
-                      : EstimateBits(parent_counts.data(), Padded(parent_symbols));
+                      : EstimateBits(leaf_counts, Padded(parent_symbols));
       base_bits += static_cast<uint32_t>(parent_extra_bits);
+      base_bits += description_cost(leaf_counts, parent_symbols, parent_count);
+      if (measure) leaf_histogram_seconds +=
+          std::chrono::duration<double>(Clock::now() - before).count();
       if (base_bits <= threshold && mul_info.empty()) continue;
     }
 
-    // Compute the maximum token in the range.
+    const auto before_parent = measure ? Clock::now() : Clock::time_point{};
     size_t max_symbols = 0;
-    for (size_t pred = 0; pred < num_predictors; pred++) {
-      for (size_t i = begin; i < end; i++) {
-        uint32_t tok = tree_samples.Token(pred, i);
-        max_symbols = max_symbols > tok + 1 ? max_symbols : tok + 1;
-      }
-    }
-    max_symbols = Padded(max_symbols);
-    std::vector<int32_t> counts(max_symbols * num_predictors);
+    std::vector<int32_t> counts;
     std::vector<uint32_t> tot_extra_bits(num_predictors);
     uint32_t total_count = 0;
-    for (size_t pred = 0; pred < num_predictors; pred++) {
-      size_t extra_bits = 0;
-      const std::vector<ResidualToken>& rtokens = tree_samples.RTokens(pred);
-      for (size_t i = begin; i < end; i++) {
-        const ResidualToken& rt = rtokens[i];
-        size_t count = tree_samples.Count(i);
-        if (pred == 0 && tree_samples.LosslessSpeedups()) total_count += count;
-        size_t eb = rt.nbits * count;
-        counts[pred * max_symbols + rt.tok] += count;
-        extra_bits += eb;
+    if (fused_parent) {
+      // Tokens are bytes. Build fixed-width histograms in one pass, reuse the
+      // leaf predictor, then compact once to the existing shared cache stride.
+      const auto collect_parent = [&](uint32_t pred, size_t) -> Status {
+        if (!known_parent && pred != leaf_pred) {
+          CollectMaParentHistogram(tree_samples, pred, begin, end,
+                                    &parent_histograms[pred]);
+        }
+        return true;
+      };
+      const bool parallel = !known_parent && pool && num_predictors > 2 && end - begin >= 8192 &&
+          static_cast<uint64_t>(end - begin) * (num_predictors - 1) >= 65536 &&
+          (!pool_initialized || worker_slots > 1);
+      if (parallel) {
+        JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_predictors, init_workers,
+                                      collect_parent, "MaParentHistograms"));
+        if (worker_slots > 1) ++parent_parallel_nodes;
+      } else {
+        for (size_t pred = 0; pred < num_predictors; ++pred) {
+          JXL_RETURN_IF_ERROR(collect_parent(pred, 0));
+        }
       }
-      tot_extra_bits[pred] = extra_bits;
+      for (const auto& h : parent_histograms) {
+        max_symbols = std::max(max_symbols, h.symbols);
+      }
+      max_symbols = histogram_stride(max_symbols);
+      counts.resize(num_predictors * max_symbols);
+      for (size_t pred = 0; pred < num_predictors; ++pred) {
+        const auto& h = parent_histograms[pred];
+        std::copy_n(h.counts.data(), h.symbols,
+                    counts.data() + pred * max_symbols);
+        tot_extra_bits[pred] = h.extra_bits;
+      }
+      total_count = parent_histograms[leaf_pred].weight;
+      if (!known_parent) parent_sample_visits +=
+          static_cast<uint64_t>(end - begin) * (num_predictors - 1);
+    } else {
+      // Compute the maximum token in the range.
+      for (size_t pred = 0; pred < num_predictors; pred++) {
+        for (size_t i = begin; i < end; i++) {
+          uint32_t tok = tree_samples.Token(pred, i);
+          max_symbols = max_symbols > tok + 1 ? max_symbols : tok + 1;
+        }
+      }
+      max_symbols = histogram_stride(max_symbols);
+      counts.resize(max_symbols * num_predictors);
+      for (size_t pred = 0; pred < num_predictors; pred++) {
+        size_t extra_bits = 0;
+        const std::vector<ResidualToken>& rtokens = tree_samples.RTokens(pred);
+        for (size_t i = begin; i < end; i++) {
+          const ResidualToken& rt = rtokens[i];
+          size_t count = tree_samples.Count(i);
+          if (pred == 0 && tree_samples.LosslessSpeedups()) total_count += count;
+          size_t eb = rt.nbits * count;
+          counts[pred * max_symbols + rt.tok] += count;
+          extra_bits += eb;
+        }
+        tot_extra_bits[pred] = extra_bits;
+      }
+      parent_sample_visits +=
+          static_cast<uint64_t>(end - begin) * num_predictors * 2;
+    }
+    if (measure) parent_histogram_seconds +=
+        std::chrono::duration<double>(Clock::now() - before_parent).count();
+    const bool incremental_node = clipped_entropy &&
+        (clipped_env[0] == '1' || clipped_env[0] == '4' ||
+         ((clipped_env[0] == '2' || clipped_env[0] == '5') && end - begin >= 2048) ||
+         (clipped_env[0] == '3' && end - begin >= 16384));
+    std::array<uint8_t, 256> symbol_mapping;
+    const size_t original_symbols = max_symbols;
+    const bool compact = compact_histograms && !cache && end - begin <= compact_limit &&
+        max_symbols >= 32 && CompactMaHistograms(num_predictors, Lanes(di),
+            &counts, &max_symbols, &symbol_mapping, dense_histograms);
+    if (compact) {
+      ++compact_nodes;
+      compact_slots_saved += (original_symbols - max_symbols) * num_predictors;
+    }
+    std::vector<size_t> predictor_symbols;
+    if (trim_entropy) {
+      predictor_symbols.resize(num_predictors);
+      for (size_t pred = 0; pred < num_predictors; ++pred) {
+        // Every child histogram is a subset of this parent. Its zero tail
+        // cannot contribute, but the shared storage/cache stride stays intact.
+        predictor_symbols[pred] = Padded(MaHistogramSymbolCount(
+            counts.data() + pred * max_symbols, max_symbols));
+      }
     }
     std::vector<double> count_entropies;
+    std::vector<std::vector<size_t>> active_blocks(sparse_entropy ? num_predictors : 0);
+    if (sparse_entropy) {
+      for (size_t pred = 0; pred < num_predictors; ++pred) {
+        active_blocks[pred] = MaActiveHistogramBlocks(
+            counts.data() + pred * max_symbols, max_symbols, Lanes(di));
+      }
+    }
     if (entropy_table) {
       count_entropies.resize(num_predictors);
       for (size_t pred = 0; pred < num_predictors; ++pred) {
@@ -487,38 +876,146 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
     }
 
     if (best != &forced_split) {
-      std::vector<int> prop_value_used_count;
-      std::vector<uint32_t> prop_value_weight;
-      std::vector<int> count_increase;
-      std::vector<size_t> extra_bits_increase;
+      // Small nodes cannot amortize a dense histogram copy. Pending sibling
+      // caches share a bounded per-tree budget, independent of tree depth.
+      if (use_cache && !cache && end - begin >= 8192) {
+        cache = MaHistogramCache::Create(tree_samples, max_symbols, &cache_budget,
+                                         property_cache);
+      }
       // For each property, compute which of its values are used, and what
       // tokens correspond to those usages. Then, iterate through the values,
       // and compute the entropy of each side of the split (of the form `prop >
       // threshold`). Finally, find the split that minimizes the cost.
-      struct CostInfo {
-        float cost = std::numeric_limits<float>::max();
-        float extra_cost = 0;
-        float Cost() const { return cost + extra_cost; }
-        Predictor pred;  // will be uninitialized in some cases, but never used.
-      };
-      std::vector<CostInfo> costs_l;
-      std::vector<CostInfo> costs_r;
-
-      std::vector<int32_t> counts_above(max_symbols);
-      std::vector<int32_t> counts_below(max_symbols);
-
       // The lower the threshold, the higher the expected noisiness of the
       // estimate. Thus, discourage changing predictors.
       float change_pred_penalty = 800.0f / (100.0f + threshold);
-      for (size_t prop = 0; prop < num_properties && base_bits > threshold;
-           prop++) {
+      std::vector<size_t> representative(num_predictors);
+      std::iota(representative.begin(), representative.end(), 0);
+      std::vector<float> predictor_penalty(num_predictors);
+      for (size_t pred = 0; pred < num_predictors; ++pred) {
+        const Predictor predictor = tree_samples.PredictorFromIndex(pred);
+        float penalty = 0;
+        if (predictor != (*tree)[pos].predictor &&
+            (*tree)[pos].predictor != Predictor::Weighted) {
+          penalty = change_pred_penalty;
+        }
+        if (predictor == Predictor::Weighted) penalty += 1e-8;
+        if (predictor == Predictor::Zero) penalty -= 1e-8;
+        predictor_penalty[pred] = penalty;
+        if (!predictor_dedup) continue;
+        for (size_t previous = 0; previous < pred; ++previous) {
+          if (representative[previous] != previous ||
+              predictor_penalty[previous] != penalty ||
+              tot_extra_bits[previous] != tot_extra_bits[pred] ||
+              std::memcmp(counts.data() + previous * max_symbols,
+                          counts.data() + pred * max_symbols,
+                          max_symbols * sizeof(counts[0])) != 0) continue;
+          const auto* a = tree_samples.RTokens(previous).data() + begin;
+          const auto* b = tree_samples.RTokens(pred).data() + begin;
+          if (std::memcmp(a, b, (end - begin) * sizeof(*a)) != 0) continue;
+          representative[pred] = previous;
+          ++equivalent_predictors;
+          break;
+        }
+      }
+      std::vector<uint8_t> race_keep;
+      bool inherited_histograms = false;
+      if (statistical_race && cache) {
+        for (size_t p = 0; p < num_properties; ++p) {
+          inherited_histograms |= cache->Has(p);
+        }
+      }
+      if (statistical_race && !inherited_histograms &&
+          base_bits > threshold && end - begin >= 262144 &&
+          num_properties > tree_samples.NumStaticProps() + 4 &&
+          MaPropertyRace::Fits(tree_samples, max_symbols)) {
+        race_keep.assign(num_properties, 1);
+        const auto before = measure ? Clock::now() : Clock::time_point{};
+        ++race_nodes;
+        MaPropertyRace race(tree_samples, begin, end, max_symbols);
+        size_t previous_draws = 0;
+        for (size_t draws : {size_t{64}, size_t{256}}) {
+          std::vector<size_t> properties;
+          for (size_t p = tree_samples.NumStaticProps(); p < num_properties; ++p) {
+            if (race_keep[p]) properties.push_back(p);
+          }
+          if (properties.size() <= 4) break;
+          const auto run = [&](uint32_t i, size_t) -> Status {
+            race.Extend(properties[i], draws);
+            return true;
+          };
+          JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, properties.size(), init_workers,
+                                        run, "MaPropertyRace"));
+          race_draws += properties.size() * MaPropertyRace::kPanels *
+                        (draws - previous_draws);
+          previous_draws = draws;
+          const auto next_keep = race.Survivors(race_keep);
+          // No useful separation at the first budget: spend remaining work on
+          // the original complete split search, not another proposal round.
+          if (next_keep == race_keep) break;
+          race_keep = next_keep;
+        }
+        for (size_t p = 0; p < num_properties; ++p) {
+          if (!race_keep[p]) {
+            ++race_pruned;
+            // A skipped cached property still describes the parent range.
+            // Never pass that stale table down as the current node's cache.
+            if (cache) cache->Invalidate(p);
+          }
+        }
+        if (measure) race_seconds +=
+            std::chrono::duration<double>(Clock::now() - before).count();
+      }
+      struct SeenProperty {
+        uint64_t signature;
+        size_t property;
+      };
+      std::vector<SeenProperty> seen_properties;
+      const bool parallel = pool && tree_samples.LosslessSpeedups() &&
+          end - begin >= 1024 &&
+          (end - begin) * num_predictors * num_properties >= 65536 &&
+          (!pool_initialized || worker_slots > 1);
+      if (speculation_trace && parallel && end - begin >= 65536) {
+        property_finished.resize(num_properties);
+      }
+      if (dedup_properties && redundant_properties.empty()) {
+        redundant_properties.resize(num_properties);
+      }
+      std::fill(property_splits.begin(), property_splits.end(),
+                std::array<SplitInfo, 4>{});
+      const auto evaluate_property = [&](uint32_t prop, size_t thread) -> Status {
+        if (!race_keep.empty() && !race_keep[prop]) return true;
+        struct CompletionStamp {
+          uint64_t* destination;
+          ~CompletionStamp() {
+            if (destination) {
+              *destination = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  Clock::now().time_since_epoch()).count();
+            }
+          }
+        } stamp{property_finished.empty() ? nullptr : &property_finished[prop]};
+        auto& w = workspaces[thread];
+        auto& prop_value_used_count = w.used_count;
+        auto& prop_value_weight = w.weight;
+        auto& count_increase = w.count_increase;
+        auto& extra_bits_increase = w.extra_bits_increase;
+        auto& paired_counts = w.paired_counts;
+        auto& paired_extra = w.paired_extra;
+        auto& costs_l = w.costs_l;
+        auto& costs_r = w.costs_r;
+        auto& counts_above = w.counts_above;
+        auto& counts_below = w.counts_below;
+        counts_above.resize(max_symbols);
+        counts_below.resize(max_symbols);
+        if (!redundant_properties.empty() && redundant_properties[prop]) {
+          if (profile.Enabled()) ++w.inherited_properties;
+          return true;
+        }
         costs_l.clear();
         costs_r.clear();
         size_t prop_size = tree_samples.NumPropertyValues(prop);
-        if (extra_bits_increase.size() < prop_size) {
-          count_increase.resize(prop_size * max_symbols);
-          extra_bits_increase.resize(prop_size);
-        }
+        // A workspace outlives the node; sibling nodes can have different
+        // symbol strides, so reset all bins rather than reuse a stale tail.
         // Clear prop_value_used_count (which cannot be cleared "on the go")
         prop_value_used_count.clear();
         prop_value_used_count.resize(prop_size);
@@ -527,9 +1024,28 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
         size_t first_used = prop_size;
         size_t last_used = 0;
 
-        // TODO(veluca): consider finding multiple splits along a single
-        // property at the same time, possibly with a bottom-up approach.
-        if (prop < tree_samples.NumStaticProps()) {
+        const bool cached_property = cache && cache->Has(prop);
+        // Both the distinct-sample count (partition boundary) and the weighted
+        // count (entropy) must follow the same sibling subtraction as tokens.
+        if (property_cache && cached_property) {
+          if (prop < tree_samples.NumStaticProps()) {
+            cache->SubtractProperty<true>(tree_samples, prop, removed_begin,
+                removed_end, prop_value_used_count.data(), prop_value_weight.data());
+          } else {
+            cache->SubtractProperty<false>(tree_samples, prop, removed_begin,
+                removed_end, prop_value_used_count.data(), prop_value_weight.data());
+          }
+          for (size_t p = 0; p < prop_size; ++p) {
+            if (prop_value_used_count[p] != 0) {
+              first_used = std::min(first_used, p);
+              last_used = p;
+            }
+          }
+          if (profile.Enabled()) {
+            ++w.property_cache_hits;
+            w.property_saved_samples += end - begin - (removed_end - removed_begin);
+          }
+        } else if (prop < tree_samples.NumStaticProps()) {
           for (size_t i = begin; i < end; i++) {
             size_t p = tree_samples.Property<true>(prop, i);
             prop_value_used_count[p]++;
@@ -553,103 +1069,407 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
         }
         // A constant property cannot split this node. Its histograms would
         // only be populated and cleared, once per predictor, with no result.
-        if (tree_samples.LosslessSpeedups() && first_used == last_used) continue;
+        if (tree_samples.LosslessSpeedups() && first_used == last_used) {
+          if (dedup_properties) {
+            redundant_properties[prop] = 1;
+            if (profile.Enabled()) ++w.constant_properties;
+          }
+          return true;
+        }
+        // Cross-property dedup requires preceding results. Parallel tasks
+        // evaluate those equivalent candidates too, then reduce in prop order.
+        if (dedup_properties && !parallel && end - begin >= 64) {
+          const bool is_static = prop < tree_samples.NumStaticProps();
+          const bool is_wp = tree_samples.PropertyFromIndex(prop) == kWPProp;
+          uint64_t signature = 14695981039346656037ULL;
+          for (size_t value = first_used; value <= last_used; ++value) {
+            if (prop_value_used_count[value] == 0) continue;
+            signature = (signature ^ value) * 1099511628211ULL;
+            signature = (signature ^ prop_value_used_count[value]) * 1099511628211ULL;
+          }
+          bool duplicate = false;
+          for (const auto& seen : seen_properties) {
+            if (seen.signature != signature ||
+                (seen.property < tree_samples.NumStaticProps()) != is_static ||
+                (tree_samples.PropertyFromIndex(seen.property) == kWPProp) != is_wp) {
+              continue;
+            }
+            // Marginals only filter comparisons. Verify every sample, since
+            // identical counts alone say nothing about the residual partition.
+            duplicate = is_static
+                ? MaSamePropertyPartition<true>(tree_samples, prop, seen.property,
+                                                 begin, end)
+                : MaSamePropertyPartition<false>(tree_samples,
+                      prop - tree_samples.NumStaticProps(),
+                      seen.property - tree_samples.NumStaticProps(), begin, end);
+            if (duplicate) break;
+          }
+          if (duplicate) {
+            // All predictor/threshold costs were already evaluated. Strict
+            // improvement and matching static/WP classes preserve tie choices.
+            if (cache) cache->Invalidate(prop);
+            redundant_properties[prop] = 1;
+            if (profile.Enabled()) {
+              ++w.duplicate_properties;
+              w.duplicate_histogram_samples += num_predictors *
+                  (cached_property ? removed_end - removed_begin : end - begin);
+            }
+            return true;
+          }
+          seen_properties.push_back({signature, prop});
+        }
+        if (property_cache && cache && !cached_property) {
+          cache->CaptureProperty(prop, prop_value_used_count.data(),
+                                  prop_value_weight.data());
+        }
+        const size_t used_bins = compact_property_bins && !cache &&
+                (sparse_property_bins || end - begin < 256 || compact)
+            ? std::count_if(prop_value_used_count.begin(), prop_value_used_count.end(),
+                              [](int count) { return count != 0; })
+            : prop_size;
+        const bool packed_bins = compact_property_bins && !cache &&
+            (sparse_property_bins || end - begin < 256 || compact) &&
+            2 * used_bins < prop_size;
+        if (packed_bins) {
+          w.property_bins.resize(prop_size);
+          size_t bin = 0;
+          for (size_t i = 0; i < prop_size; ++i)
+            if (prop_value_used_count[i]) w.property_bins[i] = bin++;
+          ++w.property_bins_compacted;
+          w.property_slots_saved += (prop_size - used_bins) * max_symbols * num_predictors;
+        }
+        count_increase.assign((packed_bins ? used_bins : prop_size) * max_symbols, 0);
+        extra_bits_increase.assign(packed_bins ? used_bins : prop_size, 0);
         costs_l.resize(last_used - first_used);
         costs_r.resize(last_used - first_used);
-        // For all predictors, compute the right and left costs of each split.
-        for (size_t pred = 0; pred < num_predictors; pred++) {
-          // Compute cost and histogram increments for each property value.
-          const auto before_histogram = trace ? Clock::now() : Clock::time_point{};
-          const std::vector<ResidualToken> &rtokens =
-              tree_samples.RTokens(pred);
-          if (prop < tree_samples.NumStaticProps()) {
-            CollectExtraBitsIncrease<true>(tree_samples, rtokens,
-                                           count_increase, extra_bits_increase,
-                                           begin, end, prop, max_symbols);
-          } else {
-            CollectExtraBitsIncrease<false>(
-                tree_samples, rtokens, count_increase, extra_bits_increase,
-                begin, end, prop - tree_samples.NumStaticProps(), max_symbols);
-          }
-          const auto before_entropy = trace ? Clock::now() : Clock::time_point{};
-          if (trace) {
-            histogram_seconds += std::chrono::duration<double>(
-                before_entropy - before_histogram).count();
-          }
-          memcpy(counts_above.data(), counts.data() + pred * max_symbols,
-                 max_symbols * sizeof counts_above[0]);
-          memset(counts_below.data(), 0, max_symbols * sizeof counts_below[0]);
-          size_t extra_bits_below = 0;
-          uint32_t count_below = 0;
-          double sum_above = entropy_table ? count_entropies[pred] : 0;
-          double sum_below = 0;
-          // Exclude last used: this ensures neither counts_above nor
-          // counts_below is empty.
-          for (size_t i = first_used; i < last_used; i++) {
+        std::vector<uint8_t> score_split;
+        if (quantile_splits && end - begin >= 512 &&
+            prop >= tree_samples.NumStaticProps() &&
+            last_used - first_used > quantile_splits) {
+          // Weighted quantile candidates, retaining both edge thresholds and
+          // every large jump. Histograms still include all training samples.
+          // This changes the learned tree, not the lossless reconstruction.
+          score_split.assign(last_used - first_used, 0);
+          uint64_t pending_weight = 0;
+          const uint64_t quantum = std::max<uint64_t>(1, total_count / quantile_splits);
+          size_t last_nonempty = first_used;
+          for (size_t i = first_used; i < last_used; ++i) {
             if (!prop_value_used_count[i]) continue;
-            extra_bits_below += extra_bits_increase[i];
-            // The increase for this property value has been used, and will not
-            // be used again: clear it. Also below.
-            extra_bits_increase[i] = 0;
-            float rbits, lbits;
-            if (tree_samples.LosslessSpeedups()) {
-              count_below += prop_value_weight[i];
-              if (entropy_table) {
-                MoveCountsAndShannonBits(
-                    counts_above.data(), counts_below.data(),
-                    count_increase.data() + i * max_symbols, max_symbols,
-                    total_count - count_below, count_below, entropy_table,
-                    &sum_above, &sum_below, &rbits, &lbits);
-              } else {
-                MoveCountsAndEstimateBits(
-                    counts_above.data(), counts_below.data(),
-                    count_increase.data() + i * max_symbols, max_symbols,
-                    total_count - count_below, count_below, &rbits, &lbits);
-              }
-            } else {
-              for (size_t sym = 0; sym < max_symbols; sym++) {
-                counts_above[sym] -= count_increase[i * max_symbols + sym];
-                counts_below[sym] += count_increase[i * max_symbols + sym];
-                count_increase[i * max_symbols + sym] = 0;
-              }
-              rbits = EstimateBits(counts_above.data(), max_symbols);
-              lbits = EstimateBits(counts_below.data(), max_symbols);
-            }
-            float rcost = rbits + tot_extra_bits[pred] - extra_bits_below;
-            float lcost = lbits + extra_bits_below;
-            JXL_DASSERT(extra_bits_below <= tot_extra_bits[pred]);
-            float penalty = 0;
-            // Never discourage moving away from the Weighted predictor.
-            if (tree_samples.PredictorFromIndex(pred) !=
-                    (*tree)[pos].predictor &&
-                (*tree)[pos].predictor != Predictor::Weighted) {
-              penalty = change_pred_penalty;
-            }
-            // If everything else is equal, disfavour Weighted (slower) and
-            // favour Zero (faster if it's the only predictor used in a
-            // group+channel combination)
-            if (tree_samples.PredictorFromIndex(pred) == Predictor::Weighted) {
-              penalty += 1e-8;
-            }
-            if (tree_samples.PredictorFromIndex(pred) == Predictor::Zero) {
-              penalty -= 1e-8;
-            }
-            if (rcost + penalty < costs_r[i - first_used].Cost()) {
-              costs_r[i - first_used].cost = rcost;
-              costs_r[i - first_used].extra_cost = penalty;
-              costs_r[i - first_used].pred =
-                  tree_samples.PredictorFromIndex(pred);
-            }
-            if (lcost + penalty < costs_l[i - first_used].Cost()) {
-              costs_l[i - first_used].cost = lcost;
-              costs_l[i - first_used].extra_cost = penalty;
-              costs_l[i - first_used].pred =
-                  tree_samples.PredictorFromIndex(pred);
+            last_nonempty = i;
+            pending_weight += prop_value_weight[i];
+            if (i == first_used || pending_weight >= quantum) {
+              score_split[i - first_used] = 1;
+              pending_weight = 0;
             }
           }
-          if (trace) {
-            entropy_seconds += std::chrono::duration<double>(
-                Clock::now() - before_entropy).count();
+          score_split[last_nonempty - first_used] = 1;
+        }
+        const bool refine_split = refine_quantiles && !score_split.empty() &&
+            uint64_t{count_increase.size()} * num_predictors * sizeof(int) <= (8u << 20);
+        if (refine_quantiles && !refine_split) score_split.clear();
+        std::vector<std::vector<int>> saved_counts(refine_split ? num_predictors : 0);
+        std::vector<std::vector<size_t>> saved_extra(refine_split ? num_predictors : 0);
+        for (int pass = 0; pass < (refine_split ? 2 : 1); ++pass) {
+          if (pass) {
+            std::vector<float> coarse_costs(score_split.size());
+            for (size_t i = 0; i < coarse_costs.size(); ++i)
+              coarse_costs[i] = costs_l[i].Cost() + costs_r[i].Cost();
+            score_split = RefineMaQuantileMask(score_split, coarse_costs);
+          }
+          // For all predictors, compute the right and left costs of each split.
+          for (size_t pred = 0; pred < num_predictors; pred++) {
+            if (representative[pred] != pred) {
+              if (cache) cache->CopyPredictor(prop, representative[pred], pred);
+              continue;
+            }
+            const size_t pair_start = pred & ~size_t{1};
+            const bool pair_available =
+                pair_start + 1 < num_predictors &&
+                representative[pair_start] == pair_start &&
+                representative[pair_start + 1] == pair_start + 1;
+            const size_t scoring_symbols =
+                trim_entropy ? predictor_symbols[pred] : max_symbols;
+            // Compute cost and histogram increments for each property value.
+            const auto before_histogram =
+                measure ? Clock::now() : Clock::time_point{};
+            if (profile.Enabled() && !pass) {
+              ++w.histogram_passes;
+              w.histogram_samples +=
+                  cached_property ? removed_end - removed_begin : end - begin;
+              if (cached_property) {
+                ++w.cache_hits;
+                w.cache_saved_samples +=
+                    end - begin - (removed_end - removed_begin);
+              }
+            }
+            const std::vector<ResidualToken>& rtokens =
+                tree_samples.RTokens(pred);
+            if (pass) {
+              count_increase = std::move(saved_counts[pred]);
+              extra_bits_increase = std::move(saved_extra[pred]);
+            } else if (packed_bins) {
+              const auto collect = [&](auto is_static, auto is_compact) {
+                CollectExtraBitsIncrease<decltype(is_static)::value,
+                                         decltype(is_compact)::value, true>(
+                    tree_samples, rtokens, count_increase, extra_bits_increase,
+                    begin, end,
+                    is_static ? prop : prop - tree_samples.NumStaticProps(),
+                    max_symbols, symbol_mapping.data(), w.property_bins.data());
+              };
+              if (prop < tree_samples.NumStaticProps()) {
+                if (compact)
+                  collect(std::true_type{}, std::true_type{});
+                else
+                  collect(std::true_type{}, std::false_type{});
+              } else {
+                if (compact)
+                  collect(std::false_type{}, std::true_type{});
+                else
+                  collect(std::false_type{}, std::false_type{});
+              }
+            } else if (compact && prop < tree_samples.NumStaticProps()) {
+              CollectExtraBitsIncrease<true, true>(
+                  tree_samples, rtokens, count_increase, extra_bits_increase,
+                  begin, end, prop, max_symbols, symbol_mapping.data());
+            } else if (compact) {
+              CollectExtraBitsIncrease<false, true>(
+                  tree_samples, rtokens, count_increase, extra_bits_increase,
+                  begin, end, prop - tree_samples.NumStaticProps(), max_symbols,
+                  symbol_mapping.data());
+            } else if (cached_property && paired_cache && end - begin >= 256 &&
+                       pair_available) {
+              if (pred % 2 == 0) {
+                paired_counts.resize(prop_size * max_symbols);
+                paired_extra.resize(prop_size);
+                if (prop < tree_samples.NumStaticProps()) {
+                  cache->SubtractPairedAndCopy<true>(
+                      tree_samples, prop, pred, removed_begin, removed_end,
+                      count_increase.data(), paired_counts.data(),
+                      extra_bits_increase.data(), paired_extra.data(),
+                      max_symbols);
+                } else {
+                  cache->SubtractPairedAndCopy<false>(
+                      tree_samples, prop, pred, removed_begin, removed_end,
+                      count_increase.data(), paired_counts.data(),
+                      extra_bits_increase.data(), paired_extra.data(),
+                      max_symbols);
+                }
+                if (profile.Enabled()) {
+                  w.paired_cache_samples += removed_end - removed_begin;
+                }
+              } else {
+                count_increase.swap(paired_counts);
+                extra_bits_increase.swap(paired_extra);
+              }
+            } else if (cached_property &&
+                       prop < tree_samples.NumStaticProps()) {
+              cache->SubtractAndCopy<true>(
+                  tree_samples, prop, pred, removed_begin, removed_end,
+                  count_increase.data(), extra_bits_increase.data(),
+                  max_symbols);
+            } else if (cached_property) {
+              cache->SubtractAndCopy<false>(
+                  tree_samples, prop, pred, removed_begin, removed_end,
+                  count_increase.data(), extra_bits_increase.data(),
+                  max_symbols);
+            } else if (fused_histogram && end - begin >= 256 &&
+                       pair_available) {
+              if (pred % 2 == 0) {
+                paired_counts.assign(prop_size * max_symbols, 0);
+                paired_extra.assign(prop_size, 0);
+                if (prop < tree_samples.NumStaticProps()) {
+                  CollectPairedMaHistogram<true>(
+                      tree_samples, prop, begin, end, max_symbols,
+                      count_increase.data(), paired_counts.data(),
+                      extra_bits_increase.data(), paired_extra.data(), pred);
+                } else {
+                  CollectPairedMaHistogram<false>(
+                      tree_samples, prop - tree_samples.NumStaticProps(), begin,
+                      end, max_symbols, count_increase.data(),
+                      paired_counts.data(), extra_bits_increase.data(),
+                      paired_extra.data(), pred);
+                }
+                if (profile.Enabled()) w.fused_pair_samples += end - begin;
+              } else {
+                count_increase.swap(paired_counts);
+                extra_bits_increase.swap(paired_extra);
+              }
+            } else if (use_shards && end - begin >= 4096 &&
+                       end - begin >= 4 * prop_size * max_symbols) {
+              if (prop < tree_samples.NumStaticProps()) {
+                CollectShardedMaHistogram<true>(
+                    tree_samples, pred, prop, begin, end, max_symbols,
+                    prop_size, count_increase.data(),
+                    extra_bits_increase.data(), &w.histogram_shards);
+              } else {
+                CollectShardedMaHistogram<false>(
+                    tree_samples, pred, prop - tree_samples.NumStaticProps(),
+                    begin, end, max_symbols, prop_size, count_increase.data(),
+                    extra_bits_increase.data(), &w.histogram_shards);
+              }
+              if (profile.Enabled()) w.sharded_samples += end - begin;
+            } else if (prop < tree_samples.NumStaticProps()) {
+              CollectExtraBitsIncrease<true>(
+                  tree_samples, rtokens, count_increase, extra_bits_increase,
+                  begin, end, prop, max_symbols);
+            } else {
+              CollectExtraBitsIncrease<false>(
+                  tree_samples, rtokens, count_increase, extra_bits_increase,
+                  begin, end, prop - tree_samples.NumStaticProps(),
+                  max_symbols);
+            }
+            if (!pass && cache && !cached_property) {
+              cache->Capture(prop, pred, count_increase.data(),
+                             extra_bits_increase.data(), max_symbols);
+            }
+            if (refine_split && !pass) {
+              saved_counts[pred] = count_increase;
+              saved_extra[pred] = extra_bits_increase;
+            }
+            const auto before_entropy =
+                measure ? Clock::now() : Clock::time_point{};
+            if (measure) {
+              w.histogram_seconds += std::chrono::duration<double>(
+                                         before_entropy - before_histogram)
+                                         .count();
+            }
+            memcpy(counts_above.data(), counts.data() + pred * max_symbols,
+                   max_symbols * sizeof counts_above[0]);
+            memset(counts_below.data(), 0,
+                   max_symbols * sizeof counts_below[0]);
+            size_t extra_bits_below = 0;
+            uint32_t count_below = 0;
+            double sum_above = entropy_table ? count_entropies[pred] : 0;
+            double sum_below = 0;
+            MaClippedEntropy clipped_above(
+                counts_above.data(), incremental_node ? max_symbols : 0,
+                incremental_node ? total_count : 0, clipped_table,
+                kCountEntropyTableSize,
+                incremental_node && clipped_env[0] >= '4');
+            MaClippedEntropy clipped_below(
+                nullptr, 0, incremental_node ? total_count : 0, clipped_table,
+                kCountEntropyTableSize,
+                incremental_node && clipped_env[0] >= '4');
+            // Exclude last used: this ensures neither counts_above nor
+            // counts_below is empty.
+            for (size_t i = first_used; i < last_used; i++) {
+              if (!prop_value_used_count[i]) continue;
+              const size_t bin = packed_bins ? w.property_bins[i] : i;
+              if (profile.Enabled()) ++w.threshold_evaluations;
+              if (profile.Enabled()) {
+                w.entropy_tail_lanes_saved += max_symbols - scoring_symbols;
+              }
+              extra_bits_below += extra_bits_increase[bin];
+              // The increase for this property value has been used, and will
+              // not be used again: clear it. Also below.
+              extra_bits_increase[bin] = 0;
+              float rbits, lbits;
+              if (tree_samples.LosslessSpeedups()) {
+                count_below += prop_value_weight[i];
+                if (!score_split.empty() && !score_split[i - first_used]) {
+                  int32_t* increase = count_increase.data() + bin * max_symbols;
+                  for (size_t s = 0; s < max_symbols; s += Lanes(di)) {
+                    const auto delta = LoadU(di, increase + s);
+                    StoreU(Sub(LoadU(di, counts_above.data() + s), delta), di,
+                           counts_above.data() + s);
+                    StoreU(Add(LoadU(di, counts_below.data() + s), delta), di,
+                           counts_below.data() + s);
+                    StoreU(Zero(di), di, increase + s);
+                  }
+                  continue;
+                }
+                if (incremental_node) {
+                  int32_t* increase = count_increase.data() + bin * max_symbols;
+                  for (size_t symbol = 0; symbol < max_symbols; ++symbol) {
+                    const int32_t delta = increase[symbol];
+                    if (!delta) continue;
+                    const int32_t r = counts_above[symbol],
+                                  l = counts_below[symbol];
+                    clipped_above.Replace(r, r - delta);
+                    clipped_below.Replace(l, l + delta);
+                    counts_above[symbol] = r - delta;
+                    counts_below[symbol] = l + delta;
+                    increase[symbol] = 0;
+                  }
+                  rbits = clipped_above.Bits(total_count - count_below);
+                  lbits = clipped_below.Bits(count_below);
+                } else if (entropy_table) {
+                  MoveCountsAndShannonBits(
+                      counts_above.data(), counts_below.data(),
+                      count_increase.data() + bin * max_symbols, max_symbols,
+                      total_count - count_below, count_below, entropy_table,
+                      &sum_above, &sum_below, &rbits, &lbits);
+                } else if (count_logs && count_below <= kMaLogTableLimit &&
+                           total_count - count_below <= kMaLogTableLimit &&
+                           total_count > kEntropyTableMaxCount) {
+                  MoveCountsAndLogBits(
+                      counts_above.data(), counts_below.data(),
+                      count_increase.data() + bin * max_symbols,
+                      scoring_symbols, total_count - count_below, count_below,
+                      count_logs, &rbits, &lbits);
+                } else if (sparse_entropy && active_blocks[pred].size() <
+                                                 max_symbols / Lanes(di)) {
+                  // Parent-zero symbols stay zero for every split. Preserve
+                  // lane indices/reduction order while skipping empty blocks.
+                  MoveCountsAndEstimateBits<true>(
+                      counts_above.data(), counts_below.data(),
+                      count_increase.data() + bin * max_symbols,
+                      scoring_symbols, total_count - count_below, count_below,
+                      active_blocks[pred].data(), active_blocks[pred].size(),
+                      &rbits, &lbits);
+                  if (profile.Enabled()) {
+                    w.entropy_blocks_saved +=
+                        max_symbols / Lanes(di) - active_blocks[pred].size();
+                  }
+                } else {
+                  MoveCountsAndEstimateBits<false>(
+                      counts_above.data(), counts_below.data(),
+                      count_increase.data() + bin * max_symbols,
+                      scoring_symbols, total_count - count_below, count_below,
+                      nullptr, 0, &rbits, &lbits);
+                }
+              } else {
+                for (size_t sym = 0; sym < max_symbols; sym++) {
+                  counts_above[sym] -= count_increase[bin * max_symbols + sym];
+                  counts_below[sym] += count_increase[bin * max_symbols + sym];
+                  count_increase[bin * max_symbols + sym] = 0;
+                }
+                rbits = EstimateBits(counts_above.data(), max_symbols);
+                lbits = EstimateBits(counts_below.data(), max_symbols);
+              }
+              float rcost = rbits + tot_extra_bits[pred] - extra_bits_below;
+              float lcost = lbits + extra_bits_below;
+              rcost += description_cost(counts_above.data(), scoring_symbols,
+                                        total_count - count_below);
+              lcost += description_cost(counts_below.data(), scoring_symbols,
+                                        count_below);
+              JXL_DASSERT(extra_bits_below <= tot_extra_bits[pred]);
+              const float penalty = predictor_penalty[pred];
+              if (rcost + penalty < costs_r[i - first_used].Cost()) {
+                costs_r[i - first_used].cost = rcost;
+                costs_r[i - first_used].extra_cost = penalty;
+                costs_r[i - first_used].pred =
+                    tree_samples.PredictorFromIndex(pred);
+              }
+              if (lcost + penalty < costs_l[i - first_used].Cost()) {
+                costs_l[i - first_used].cost = lcost;
+                costs_l[i - first_used].extra_cost = penalty;
+                costs_l[i - first_used].pred =
+                    tree_samples.PredictorFromIndex(pred);
+              }
+            }
+            if (measure) {
+              w.entropy_seconds +=
+                  std::chrono::duration<double>(Clock::now() - before_entropy)
+                      .count();
+            }
+            if (cache) {
+              // The old scratch path never reads the last bin. Cached tables
+              // must retain a complete, predictor-specific histogram instead.
+              extra_bits_increase[last_used] = 0;
+              std::fill_n(count_increase.data() + last_used * max_symbols,
+                          max_symbols, 0);
+            }
           }
         }
         // Iterate through the possible splits and find the one with minimum sum
@@ -658,6 +1478,7 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
         for (size_t i = first_used; i < last_used; i++) {
           if (!prop_value_used_count[i]) continue;
           split += prop_value_used_count[i];
+          if (!score_split.empty() && !score_split[i - first_used]) continue;
           float rcost = costs_r[i - first_used].cost;
           float lcost = costs_l[i - first_used].cost;
 
@@ -668,9 +1489,8 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
 
           SplitInfo &best_ref =
               tree_samples.PropertyFromIndex(prop) < kNumStaticProperties
-                  ? (zero_entropy_side ? best_split_static_constant
-                                       : best_split_static)
-                  : (uses_wp ? best_split_nonstatic : best_split_nowp);
+                  ? property_splits[prop][zero_entropy_side ? 0 : 1]
+                  : property_splits[prop][uses_wp ? 2 : 3];
           if (lcost + rcost < best_ref.Cost()) {
             best_ref.prop = prop;
             best_ref.val = i;
@@ -682,9 +1502,39 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
           }
         }
         // Clear extra_bits_increase and cost_increase for last_used.
-        extra_bits_increase[last_used] = 0;
+        const size_t last_bin = packed_bins ? w.property_bins[last_used] : last_used;
+        extra_bits_increase[last_bin] = 0;
         for (size_t sym = 0; sym < max_symbols; sym++) {
-          count_increase[last_used * max_symbols + sym] = 0;
+          count_increase[last_bin * max_symbols + sym] = 0;
+        }
+        return true;
+      };
+      if (base_bits > threshold) {
+        if (parallel) {
+          const auto before = measure ? Clock::now() : Clock::time_point{};
+          JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_properties, init_workers,
+                                        evaluate_property, "MaSplitProperties"));
+          if (worker_slots > 1) {
+            ++parallel_nodes;
+            parallel_properties += num_properties;
+          }
+          if (measure) parallel_seconds +=
+              std::chrono::duration<double>(Clock::now() - before).count();
+        } else {
+          for (size_t prop = 0; prop < num_properties; ++prop) {
+            JXL_RETURN_IF_ERROR(evaluate_property(prop, 0));
+          }
+        }
+      }
+      // Preserve strict improvement and stable ties independently of task
+      // completion order. Partitioning starts only after every task has joined.
+      SplitInfo* winners[] = {&best_split_static_constant, &best_split_static,
+                             &best_split_nonstatic, &best_split_nowp};
+      for (const auto& candidates : property_splits) {
+        for (size_t i = 0; i < candidates.size(); ++i) {
+          if (candidates[i].Cost() < winners[i]->Cost()) {
+            *winners[i] = candidates[i];
+          }
         }
       }
 
@@ -703,6 +1553,55 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
       if (best_split_static_constant.Cost() + threshold < base_bits) {
         best = &best_split_static_constant;
       }
+      if (!property_finished.empty() && base_bits > threshold) {
+        ++speculation_nodes;
+        auto completion = property_finished;
+        std::sort(completion.begin(), completion.end());
+        const auto choose = [&](const std::array<SplitInfo, 4>& candidates) {
+          size_t winner = 2;
+          if (candidates[3].Cost() + threshold < base_bits &&
+              candidates[3].Cost() <=
+                  fast_decode_multiplier * candidates[winner].Cost()) {
+            winner = 3;
+          }
+          if (candidates[1].Cost() + threshold < base_bits &&
+              candidates[1].Cost() <=
+                  fast_decode_multiplier * candidates[winner].Cost()) {
+            winner = 1;
+          }
+          if (candidates[0].Cost() + threshold < base_bits) winner = 0;
+          return candidates[winner];
+        };
+        // Replay only results already completed at each launch point. This
+        // measures opportunity; it does not launch or assume free CPU for a
+        // guessed subtree, and cannot change the real split decision.
+        for (size_t quarter = 1; quarter <= 3; ++quarter) {
+          const uint64_t cutoff =
+              completion[std::max(size_t{1}, num_properties * quarter / 4) - 1];
+          std::array<SplitInfo, 4> candidates;
+          for (size_t prop = 0; prop < num_properties; ++prop) {
+            if (property_finished[prop] > cutoff) continue;
+            for (size_t c = 0; c < candidates.size(); ++c) {
+              if (property_splits[prop][c].Cost() < candidates[c].Cost()) {
+                candidates[c] = property_splits[prop][c];
+              }
+            }
+          }
+          const auto predicted = choose(candidates);
+          if (!(predicted.Cost() + threshold < base_bits)) continue;
+          auto& stats = speculation[quarter - 1];
+          ++stats.attempts;
+          const uint64_t lead = completion.back() - cutoff;
+          stats.lead_ns += lead;
+          if (best->Cost() + threshold < base_bits &&
+              predicted.prop == best->prop && predicted.val == best->val &&
+              predicted.lpred == best->lpred && predicted.rpred == best->rpred) {
+            ++stats.hits;
+            stats.hit_lead_ns += lead;
+            stats.max_hit_lead_ns = std::max(stats.max_hit_lead_ns, lead);
+          }
+        }
+      }
     }
 
     if (best->Cost() + threshold < base_bits) {
@@ -712,7 +1611,17 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
       // Split node and try to split children.
       MakeSplitNode(pos, p, dequant, best->lpred, 0, best->rpred, 0, tree);
       // "Sort" according to winning property
-      if (best->prop < tree_samples.NumStaticProps()) {
+      const auto before_partition = measure ? Clock::now() : Clock::time_point{};
+      if (batch_partition && end - begin >= 256) {
+        ++batch_partition_nodes;
+        if (best->prop < tree_samples.NumStaticProps()) {
+          SplitTreeSamples<true, true>(tree_samples, begin, best->pos, end,
+                                       best->prop, best->val);
+        } else {
+          SplitTreeSamples<false, true>(tree_samples, begin, best->pos, end,
+              best->prop - tree_samples.NumStaticProps(), best->val);
+        }
+      } else if (best->prop < tree_samples.NumStaticProps()) {
         SplitTreeSamples<true>(tree_samples, begin, best->pos, end, best->prop,
                                best->val);
       } else {
@@ -721,6 +1630,10 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
                                 best->val);
       }
       auto new_sp_range = static_prop_range;
+      if (measure) {
+        partition_seconds += std::chrono::duration<double>(
+            Clock::now() - before_partition).count();
+      }
       if (p < kNumStaticProperties) {
         JXL_DASSERT(static_cast<uint32_t>(dequant + 1) <= new_sp_range[p][1]);
         new_sp_range[p][1] = dequant + 1;
@@ -728,6 +1641,7 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
       }
       nodes.push_back(
           NodeInfo{(*tree)[pos].rchild, begin, best->pos, new_sp_range});
+      nodes.back().redundant_properties = redundant_properties;
       new_sp_range = static_prop_range;
       if (p < kNumStaticProperties) {
         JXL_DASSERT(new_sp_range[p][0] <= static_cast<uint32_t>(dequant + 1));
@@ -736,18 +1650,320 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
       }
       nodes.push_back(
           NodeInfo{(*tree)[pos].lchild, best->pos, end, new_sp_range});
+      nodes.back().redundant_properties = std::move(redundant_properties);
+      // Reuse only for sufficiently unbalanced splits. A balanced sibling
+      // would cost as much to subtract as directly scanning the child.
+      const size_t low = best->pos - begin, high = end - best->pos;
+      if (reuse_parent && std::min(low, high) <= (end - begin - 1) / 3 &&
+          std::max(low, high) >= 512 &&
+          !(parallel_subtrees && pool_initialized && worker_slots > 1 &&
+            std::max(low, high) <= subtree_grain)) {
+        // Only scan the smaller child. Integer histogram subtraction recovers
+        // all predictors of its larger sibling without visiting those samples.
+        auto& smaller = nodes[nodes.size() - (low <= high ? 2 : 1)];
+        auto& larger = nodes[nodes.size() - (low > high ? 2 : 1)];
+        smaller.parents.resize(num_predictors);
+        larger.parents.resize(num_predictors);
+        for (size_t pred = 0; pred < num_predictors; ++pred) {
+          CollectMaParentHistogram(tree_samples, pred, smaller.begin, smaller.end,
+                                    &smaller.parents[pred]);
+          larger.parents[pred] = SubtractMaParentHistogram(
+              parent_histograms[pred], smaller.parents[pred]);
+        }
+        parent_sample_visits += num_predictors * (smaller.end - smaller.begin);
+        parent_subtracted_samples += num_predictors * (larger.end - larger.begin);
+      }
+      if (cache && best != &forced_split && std::min(low, high) <= (end - begin - 1) / 3 &&
+          std::max(low, high) >= 4096) {
+        NodeInfo& larger = nodes[nodes.size() - (low > high ? 2 : 1)];
+        larger.histograms = std::move(cache);
+        larger.removed_begin = low > high ? best->pos : begin;
+        larger.removed_end = low > high ? end : best->pos;
+      }
     }
   }
+  if (!subtrees.empty()) {
+    LosslessProfileScope dispatch(profile.Id(), "ma.subtrees");
+    std::vector<size_t> order(subtrees.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+      return subtrees[a].end - subtrees[a].begin >
+             subtrees[b].end - subtrees[b].begin;
+    });
+    const size_t tasks = std::min(worker_slots,
+        LosslessWorkerLimits::FromEnvironment().Tasks(
+            subtrees.size(), MaHistogramBudget::kLimit));
+    std::atomic<size_t> next{0};
+    const auto init_subtrees = [&](size_t threads) -> Status {
+      dispatch.Set("worker_slots", threads);
+      return true;
+    };
+    const auto learn_subtrees = [&](uint32_t, size_t) -> Status {
+      for (;;) {
+        const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+        if (index >= order.size()) break;
+        auto& job = subtrees[order[index]];
+        // Quantization is shared and immutable. Swaps touch only this job's
+        // disjoint range; tree storage and histogram budgets are task-local.
+        JXL_RETURN_IF_ERROR(FindBestSplitImpl(
+            tree_samples, threshold, mul_info, job.range,
+            fast_decode_multiplier, &job.tree, nullptr, job.begin, job.end,
+            std::move(job.redundant), true, dispatch.Id()));
+      }
+      return true;
+    };
+    dispatch.Set("jobs", subtrees.size());
+    dispatch.Set("worker_tasks", tasks);
+    dispatch.Set("max_samples", subtrees[order.front()].end -
+                                    subtrees[order.front()].begin);
+    dispatch.Set("balanced", balanced_subtrees);
+    dispatch.Set("cache_budget_bytes", tasks * MaHistogramBudget::kLimit);
+    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, tasks, init_subtrees, learn_subtrees,
+                                  "MaSubtrees"));
+    size_t added_nodes = 0;
+    for (const auto& job : subtrees) {
+      // Child indices are local to the job. The root replaces its original
+      // leaf, while all other nodes are appended after the pool has joined.
+      JXL_ENSURE(!job.tree.empty());
+      JXL_ENSURE(tree->size() <= kMaxTreeSize);
+      JXL_ENSURE(job.tree.size() - 1 <= kMaxTreeSize - tree->size());
+      const size_t offset = tree->size() - 1;
+      for (size_t i = 0; i < job.tree.size(); ++i) {
+        auto node = job.tree[i];
+        if (node.property >= 0) {
+          node.lchild += offset;
+          node.rchild += offset;
+        }
+        if (i == 0) {
+          (*tree)[job.destination] = node;
+        } else {
+          tree->push_back(node);
+        }
+      }
+      added_nodes += job.tree.size() - 1;
+    }
+    dispatch.Set("added_nodes", added_nodes);
+  }
+  if (paired_cache && profile.Enabled()) {
+    LosslessProfileScope measured(profile.Id(), "ma.paired_cache_stats");
+    uint64_t samples = 0;
+    for (const auto& w : workspaces) samples += w.paired_cache_samples;
+    measured.Set("paired_samples", samples);
+  }
+  if (profile.Enabled()) {
+    LosslessProfileScope measured(profile.Id(), "ma.compact_histogram_stats");
+    measured.Set("nodes", compact_nodes);
+    measured.Set("parent_slots_saved", compact_slots_saved);
+    uint64_t property_bins = 0, property_slots = 0;
+    for (const auto& w : workspaces) {
+      property_bins += w.property_bins_compacted;
+      property_slots += w.property_slots_saved;
+    }
+    measured.Set("property_bins_compacted", property_bins);
+    measured.Set("property_slots_saved", property_slots);
+  }
+  if (speculation_trace) {
+    for (size_t i = 0; i < speculation.size(); ++i) {
+      LosslessProfileScope measured(profile.Id(), "ma.speculation_stats");
+      const auto& stats = speculation[i];
+      measured.Set("completed_percent", (i + 1) * 25);
+      measured.Set("eligible_nodes", speculation_nodes);
+      measured.Set("attempts", stats.attempts);
+      measured.Set("hits", stats.hits);
+      measured.Set("lead_ns", stats.lead_ns);
+      measured.Set("hit_lead_ns", stats.hit_lead_ns);
+      measured.Set("max_hit_lead_ns", stats.max_hit_lead_ns);
+    }
+  }
+  for (const auto& w : workspaces) {
+    histogram_seconds += w.histogram_seconds;
+    entropy_seconds += w.entropy_seconds;
+    histogram_passes += w.histogram_passes;
+    histogram_samples += w.histogram_samples;
+    threshold_evaluations += w.threshold_evaluations;
+    entropy_blocks_saved += w.entropy_blocks_saved;
+    sharded_samples += w.sharded_samples;
+    cache_hits += w.cache_hits;
+    cache_saved_samples += w.cache_saved_samples;
+    fused_pair_samples += w.fused_pair_samples;
+    entropy_tail_lanes_saved += w.entropy_tail_lanes_saved;
+    duplicate_properties += w.duplicate_properties;
+    duplicate_histogram_samples += w.duplicate_histogram_samples;
+    constant_properties += w.constant_properties;
+    inherited_properties += w.inherited_properties;
+    property_cache_hits += w.property_cache_hits;
+    property_saved_samples += w.property_saved_samples;
+  }
+  {
+    LosslessProfileScope equivalence(profile.Id(), "ma.predictor_equivalence");
+    equivalence.Set("enabled", predictor_dedup);
+    equivalence.Set("equivalent_predictors", equivalent_predictors);
+    equivalence.Set("padded_histogram", padded_histogram);
+    equivalence.Set("padded_nodes", padded_nodes);
+  }
+  profile.Set("split_worker_slots", worker_slots);
+  profile.Set("parallel_nodes", parallel_nodes);
+  profile.Set("parallel_properties", parallel_properties);
+  profile.Set("parallel_wall_ns", static_cast<uint64_t>(parallel_seconds * 1e9));
+  profile.Set("parent_parallel_nodes", parent_parallel_nodes);
+  profile.Set("parent_sample_visits", parent_sample_visits);
+  profile.Set("parent_reused_nodes", parent_reused_nodes);
+  profile.Set("parent_subtracted_samples", parent_subtracted_samples);
+  profile.Set("leaf_histogram_ns",
+              static_cast<uint64_t>(leaf_histogram_seconds * 1e9));
+  profile.Set("parent_histogram_ns",
+              static_cast<uint64_t>(parent_histogram_seconds * 1e9));
+  profile.Set("samples", sample_end - sample_begin);
+  profile.Set("nodes", tree->size());
+  profile.Set("nodes_visited", nodes_visited);
+  profile.Set("predictors", num_predictors);
+  profile.Set("properties", num_properties);
+  profile.Set("histogram_passes", histogram_passes);
+  profile.Set("race_nodes", race_nodes);
+  profile.Set("race_draws", race_draws);
+  profile.Set("race_pruned_properties", race_pruned);
+  profile.Set("race_ns", static_cast<uint64_t>(race_seconds * 1e9));
+  profile.Set("histogram_samples", histogram_samples);
+  profile.Set("threshold_evaluations", threshold_evaluations);
+  profile.Set("entropy_blocks_saved", entropy_blocks_saved);
+  profile.Set("sharded_samples", sharded_samples);
+  profile.Set("histogram_ns", static_cast<uint64_t>(histogram_seconds * 1e9));
+  profile.Set("split_entropy_ns", static_cast<uint64_t>(entropy_seconds * 1e9));
+  profile.Set("partition_ns", static_cast<uint64_t>(partition_seconds * 1e9));
+  profile.Set("batch_partition_nodes", batch_partition_nodes);
+  profile.Set("fused_pair_samples", fused_pair_samples);
+  profile.Set("entropy_tail_lanes_saved", entropy_tail_lanes_saved);
+  profile.Set("duplicate_properties", duplicate_properties);
+  profile.Set("duplicate_histogram_samples", duplicate_histogram_samples);
+  profile.Set("constant_properties", constant_properties);
+  profile.Set("inherited_properties", inherited_properties);
+  profile.Set("histogram_cache_hits", cache_hits);
+  profile.Set("histogram_saved_samples", cache_saved_samples);
+  profile.Set("histogram_cache_peak_bytes", cache_budget.peak);
+  profile.Set("property_cache", property_cache);
+  profile.Set("property_cache_hits", property_cache_hits);
+  profile.Set("property_saved_samples", property_saved_samples);
   if (trace) {
     const double total = std::chrono::duration<double>(Clock::now() - start).count();
     std::fprintf(stderr,
                  "lossless-ma samples=%" PRIuS " nodes=%" PRIuS
-                 " histogram_s=%.6f entropy_s=%.6f other_s=%.6f\n",
+                 " histogram_work_s=%.6f entropy_work_s=%.6f wall_s=%.6f\n",
                  tree_samples.NumDistinctSamples(), tree->size(),
                  histogram_seconds, entropy_seconds,
-                 total - histogram_seconds - entropy_seconds);
+                 total);
     std::fflush(stderr);
   }
+  return true;
+}
+
+Status FindBestSplit(TreeSamples &tree_samples, float threshold,
+                    const std::vector<ModularMultiplierInfo> &mul_info,
+                    StaticPropRange initial_static_prop_range,
+                    float fast_decode_multiplier, Tree *tree, ThreadPool *pool) {
+  const char* channels_env = std::getenv("JXL_MA_CHANNEL_TREE");
+  if (tree_samples.ChannelTreeEligible() && mul_info.empty() &&
+      tree_samples.NumDistinctSamples() >= 8192 && tree_samples.NumStaticProps() &&
+      tree_samples.PropertyFromIndex(0) == 0 && tree_samples.NumPropertyValues(0) <= 32 &&
+      channels_env && channels_env[0] >= '1' && channels_env[0] <= '3' && channels_env[1] == '\0') {
+    const size_t size = tree_samples.NumDistinctSamples();
+    std::vector<size_t> counts(tree_samples.NumPropertyValues(0));
+    for (size_t i = 0; i < size; ++i) ++counts[tree_samples.Property<true>(0, i)];
+    std::vector<size_t> occupied;
+    for (size_t i = 0; i < counts.size(); ++i) if (counts[i]) occupied.push_back(i);
+    if (occupied.size() > 1) {
+      LosslessProfileScope profile(LosslessProfileCurrent(), "ma.channel_trees");
+      struct Part {
+        size_t node, begin, end, lo, hi;
+        StaticPropRange range;
+        Tree learned;
+        size_t depth = 0;
+      };
+      std::vector<Part> pending{{0, 0, size, 0, occupied.size(), initial_static_prop_range, {}}};
+      std::vector<Part> jobs;
+      const Predictor pred = tree_samples.PredictorFromIndex(0);
+      size_t spatial = tree_samples.NumProperties();
+      for (size_t i = tree_samples.NumStaticProps(); i < tree_samples.NumProperties(); ++i)
+        if (tree_samples.PropertyFromIndex(i) == 2) spatial = i;
+      while (!pending.empty()) {
+        Part p = std::move(pending.back());
+        pending.pop_back();
+        if (p.hi - p.lo == 1) {
+          if (spatial != tree_samples.NumProperties() &&
+              p.depth < size_t(channels_env[0] - '1') && p.end - p.begin >= 16384) {
+            std::vector<size_t> bins(tree_samples.NumPropertyValues(spatial));
+            const size_t property = spatial - tree_samples.NumStaticProps();
+            for (size_t i = p.begin; i < p.end; ++i)
+              ++bins[tree_samples.Property<false>(property, i)];
+            size_t lower = 0, quant = 0;
+            for (; quant + 1 < bins.size(); ++quant) {
+              lower += bins[quant];
+              if (2 * lower >= p.end - p.begin) break;
+            }
+            if (quant + 1 < bins.size() && lower >= 4096 && p.end - p.begin - lower >= 4096) {
+              const size_t cut = p.begin + lower;
+              MakeSplitNode(p.node, 2, tree_samples.UnquantizeProperty(spatial, quant),
+                            pred, 0, pred, 0, tree);
+              SplitTreeSamples<false, true>(tree_samples, p.begin, cut, p.end, property, quant);
+              pending.push_back({(*tree)[p.node].rchild, p.begin, cut, p.lo, p.hi, p.range, {}, p.depth + 1});
+              pending.push_back({(*tree)[p.node].lchild, cut, p.end, p.lo, p.hi, p.range, {}, p.depth + 1});
+              continue;
+            }
+          }
+          p.learned.push_back((*tree)[p.node]);
+          jobs.push_back(std::move(p));
+          continue;
+        }
+        const size_t mid = p.lo + (p.hi - p.lo) / 2;
+        size_t cut = p.begin;
+        for (size_t i = p.lo; i < mid; ++i) cut += counts[occupied[i]];
+        const size_t quant = occupied[mid - 1];
+        const int split = tree_samples.UnquantizeProperty(0, quant);
+        JXL_ENSURE(split >= 0 && uint64_t{static_cast<uint32_t>(split)} + 1 < p.range[0][1]);
+        MakeSplitNode(p.node, 0, split, pred, 0, pred, 0, tree);
+        SplitTreeSamples<true, true>(tree_samples, p.begin, cut, p.end, 0, quant);
+        auto low = p.range, high = p.range;
+        low[0][1] = split + 1;
+        high[0][0] = split + 1;
+        pending.push_back({(*tree)[p.node].rchild, p.begin, cut, p.lo, mid, low, {}});
+        pending.push_back({(*tree)[p.node].lchild, cut, p.end, mid, p.hi, high, {}});
+      }
+      // A channel split is normal static-property syntax. Quantization is
+      // shared; every learner mutates only its own already-partitioned samples.
+      // The shared arena allows nested property/subtree work without new pools.
+      const auto limits = LosslessWorkerLimits::FromEnvironment();
+      LosslessProbePool arena;
+      JXL_RETURN_IF_ERROR(arena.Run(jobs.size(), pool, limits.tasks,
+          limits.Tasks(jobs.size(), MaHistogramBudget::kLimit),
+          [&](size_t i, ThreadPool* nested) -> Status {
+            auto& p = jobs[i];
+            return FindBestSplitImpl(tree_samples, threshold, mul_info, p.range,
+                fast_decode_multiplier, &p.learned, nested, p.begin, p.end,
+                {}, false, profile.Id());
+          }));
+      for (const auto& p : jobs) {
+        JXL_ENSURE(!p.learned.empty() && tree->size() <= kMaxTreeSize);
+        JXL_ENSURE(p.learned.size() - 1 <= kMaxTreeSize - tree->size());
+        const size_t offset = tree->size() - 1;
+        for (size_t i = 0; i < p.learned.size(); ++i) {
+          auto node = p.learned[i];
+          if (node.property >= 0) {
+            node.lchild += offset;
+            node.rchild += offset;
+          }
+          if (i == 0) (*tree)[p.node] = node;
+          else tree->push_back(node);
+        }
+      }
+      profile.Set("channels", occupied.size());
+      profile.Set("jobs", jobs.size());
+      profile.Set("samples", size);
+      return true;
+    }
+  }
+  return FindBestSplitImpl(
+      tree_samples, threshold, mul_info, initial_static_prop_range,
+      fast_decode_multiplier, tree, pool, 0, tree_samples.NumDistinctSamples(),
+      {}, false, LosslessProfileCurrent());
 }
 
 // NOLINTNEXTLINE(google-readability-namespace-comments)
@@ -763,7 +1979,8 @@ HWY_EXPORT(FindBestSplit);  // Local function.
 Status ComputeBestTree(TreeSamples &tree_samples, float threshold,
                        const std::vector<ModularMultiplierInfo> &mul_info,
                        StaticPropRange static_prop_range,
-                       float fast_decode_multiplier, Tree *tree) {
+                       float fast_decode_multiplier, Tree *tree,
+                       ThreadPool *pool) {
   // TODO(veluca): take into account that different contexts can have different
   // uint configs.
   //
@@ -777,16 +1994,20 @@ Status ComputeBestTree(TreeSamples &tree_samples, float threshold,
 
   JXL_ENSURE(tree_samples.NumDistinctSamples() <=
              std::numeric_limits<uint32_t>::max());
-  HWY_DYNAMIC_DISPATCH(FindBestSplit)
+  return HWY_DYNAMIC_DISPATCH(FindBestSplit)
   (tree_samples, threshold, mul_info, static_prop_range, fast_decode_multiplier,
-   tree);
-  return true;
+   tree, pool);
 }
 
 #if JXL_CXX_LANG < JXL_CXX_17
 constexpr int32_t TreeSamples::kPropertyRange;
 constexpr uint32_t TreeSamples::kDedupEntryUnused;
 #endif
+
+bool TreeSamples::FastDedupRequested() {
+  const char* value = std::getenv("JXL_MA_FAST_DEDUP");
+  return !value || std::strcmp(value, "1") == 0;
+}
 
 Status TreeSamples::SetPredictor(Predictor predictor,
                                  ModularOptions::TreeMode wp_tree_mode) {
@@ -852,7 +2073,13 @@ Status TreeSamples::SetProperties(const std::vector<uint32_t> &properties,
 void TreeSamples::InitTable(size_t log_size) {
   size_t size = 1ULL << log_size;
   if (dedup_table_.size() == size) return;
-  dedup_table_.resize(size, kDedupEntryUnused);
+  if (fast_dedup_) {
+    // Rehash into empty slots. Retaining old entries can register a sample
+    // twice, leaving a stale alias after its 16-bit count saturates.
+    dedup_table_.assign(size, kDedupEntryUnused);
+  } else {
+    dedup_table_.resize(size, kDedupEntryUnused);
+  }
   for (size_t i = 0; i < NumDistinctSamples(); i++) {
     if (sample_counts[i] != std::numeric_limits<uint16_t>::max()) {
       AddToTable(i);
@@ -862,7 +2089,7 @@ void TreeSamples::InitTable(size_t log_size) {
 
 bool TreeSamples::AddToTableAndMerge(size_t a) {
   size_t pos1 = Hash1(a);
-  size_t pos2 = Hash2(a);
+  size_t pos2 = fast_dedup_ ? 0 : Hash2(a);
   if (dedup_table_[pos1] != kDedupEntryUnused &&
       IsSameSample(a, dedup_table_[pos1])) {
     JXL_DASSERT(sample_counts[a] == 1);
@@ -874,6 +2101,7 @@ bool TreeSamples::AddToTableAndMerge(size_t a) {
     }
     return true;
   }
+  if (fast_dedup_) pos2 = Hash2(a);
   if (dedup_table_[pos2] != kDedupEntryUnused &&
       IsSameSample(a, dedup_table_[pos2])) {
     JXL_DASSERT(sample_counts[a] == 1);
@@ -885,13 +2113,199 @@ bool TreeSamples::AddToTableAndMerge(size_t a) {
     }
     return true;
   }
-  AddToTable(a);
+  if (fast_dedup_) {
+    // Reuse the probe positions; the sample and table have not changed.
+    AddToTable(a, pos1, pos2);
+  } else {
+    AddToTable(a);
+  }
   return false;
 }
 
 void TreeSamples::AddToTable(size_t a) {
-  size_t pos1 = Hash1(a);
-  size_t pos2 = Hash2(a);
+  AddToTable(a, Hash1(a), Hash2(a));
+}
+
+bool TreeSamples::AddWeightedToTableAndMerge(size_t a) {
+  return AddWeightedToTableAndMerge(a, Hash1(a), Hash2(a));
+}
+
+bool TreeSamples::AddWeightedToTableAndMerge(size_t a, size_t pos1, size_t pos2) {
+  const size_t positions[] = {pos1, pos2};
+  for (size_t pos : positions) {
+    const uint32_t previous = dedup_table_[pos];
+    if (previous == kDedupEntryUnused || !IsSameSample(a, previous)) continue;
+    const uint32_t take = std::min<uint32_t>(
+        sample_counts[a],
+        std::numeric_limits<uint16_t>::max() - sample_counts[previous]);
+    sample_counts[previous] += take;
+    sample_counts[a] -= take;
+    if (sample_counts[previous] == std::numeric_limits<uint16_t>::max()) {
+      dedup_table_[pos] = kDedupEntryUnused;
+    }
+    if (sample_counts[a] == 0) return true;
+  }
+  if (sample_counts[a] != std::numeric_limits<uint16_t>::max()) {
+    AddToTable(a, positions[0], positions[1]);
+  }
+  return false;
+}
+
+void TreeSamples::HashBatch(size_t begin, size_t count, uint64_t* first,
+                           uint64_t* second) const {
+  constexpr uint64_t c1 = 0x1e35a7bd, c2 = 0x1e35a7bd1e35a7bd;
+  std::fill_n(first, count, c1);
+  std::fill_n(second, count, c2);
+  // Traverse each contiguous field once, with independent hash chains per row.
+  // Preserve both original hash functions, including their field order.
+  for (const auto& r : residuals) {
+    for (size_t i = 0; i < count; ++i) {
+      first[i] = (first[i] * c1 + r[begin + i].tok) * c1 + r[begin + i].nbits;
+    }
+  }
+  for (size_t p = 0; p < num_static_props; ++p) {
+    for (size_t i = 0; i < count; ++i) {
+      first[i] = first[i] * c1 + static_props[p][begin + i];
+      second[i] = second[i] * c2 ^ static_props[p][begin + i];
+    }
+  }
+  for (const auto& p : props) {
+    for (size_t i = 0; i < count; ++i) {
+      first[i] = first[i] * c1 + p[begin + i];
+      second[i] = second[i] * c2 ^ p[begin + i];
+    }
+  }
+  for (const auto& r : residuals) {
+    for (size_t i = 0; i < count; ++i) {
+      second[i] = (second[i] * c2 ^ r[begin + i].tok) * c2 ^ r[begin + i].nbits;
+    }
+  }
+  for (size_t i = 0; i < count; ++i) {
+    first[i] = (first[i] >> 16) & (dedup_table_.size() - 1);
+    second[i] = (second[i] >> 16) & (dedup_table_.size() - 1);
+  }
+}
+
+void TreeSamples::MergeSampleBatch(const TreeSamples& batch, size_t begin,
+                                  size_t end) {
+  constexpr size_t kBatch = 256;
+  std::array<uint64_t, kBatch> first, second;
+  std::array<size_t, kBatch> retained;
+  for (size_t start = begin; start < end;) {
+    const size_t count = std::min(kBatch, end - start);
+    const size_t base = sample_counts.size();
+    const auto append = [&](auto& target, const auto& source) {
+      target.insert(target.end(), source.begin() + start,
+                    source.begin() + start + count);
+    };
+    for (size_t p = 0; p < residuals.size(); ++p) {
+      append(residuals[p], batch.residuals[p]);
+    }
+    for (size_t p = 0; p < num_static_props; ++p) {
+      append(static_props[p], batch.static_props[p]);
+    }
+    for (size_t p = 0; p < props.size(); ++p) append(props[p], batch.props[p]);
+    append(sample_counts, batch.sample_counts);
+    HashBatch(base, count, first.data(), second.data());
+    size_t kept = 0;
+    for (size_t i = 0; i < count; ++i) {
+      if (!AddWeightedToTableAndMerge(base + i, first[i], second[i])) {
+        retained[kept++] = i;
+      }
+    }
+    start += count;
+    if (kept == count) continue;
+    // Hash entries still refer to un-compacted rows. Remap in increasing order
+    // before moving fields, retaining the saturation rules of scalar merging.
+    for (size_t i = 0; i < kept; ++i) {
+      const size_t old = base + retained[i], next = base + i;
+      if (dedup_table_[first[retained[i]]] == old) {
+        dedup_table_[first[retained[i]]] = next;
+      }
+      if (dedup_table_[second[retained[i]]] == old) {
+        dedup_table_[second[retained[i]]] = next;
+      }
+    }
+    const auto compact = [&](auto& field) {
+      for (size_t i = 0; i < kept; ++i) field[base + i] = field[base + retained[i]];
+      field.resize(base + kept);
+    };
+    for (auto& r : residuals) compact(r);
+    for (size_t p = 0; p < num_static_props; ++p) compact(static_props[p]);
+    for (auto& p : props) compact(p);
+    compact(sample_counts);
+  }
+}
+
+Status TreeSamples::MergeSamples(std::vector<TreeSamples>& batches) {
+  JXL_ENSURE(NumSamples() == 0 && !HasSamples());
+  return AppendSamples(batches);
+}
+
+Status TreeSamples::AppendSamples(std::vector<TreeSamples>& batches) {
+  FlushSampleBatch();
+  for (auto& batch : batches) batch.FlushSampleBatch();
+  JXL_ENSURE(!HasSamples() || !dedup_table_.empty());
+  JXL_ENSURE(!predictors.empty() && !props_to_use.empty());
+  const size_t previous_distinct = NumDistinctSamples();
+  size_t total_distinct = previous_distinct, total_samples = NumSamples();
+  for (const auto& batch : batches) {
+    JXL_ENSURE(predictors == batch.predictors &&
+               props_to_use == batch.props_to_use &&
+               compact_properties == batch.compact_properties &&
+               num_static_props == batch.num_static_props);
+    JXL_ENSURE(batch.NumDistinctSamples() <=
+               std::numeric_limits<uint32_t>::max() - total_distinct);
+    JXL_ENSURE(batch.NumSamples() <=
+               std::numeric_limits<size_t>::max() - total_samples);
+    total_distinct += batch.NumDistinctSamples();
+    total_samples += batch.NumSamples();
+  }
+  if (total_distinct == previous_distinct) return true;
+  const char* batch_env = std::getenv("JXL_MA_BATCH_MERGE");
+  const bool batch_merge = lossless_speedups_ && batch_env &&
+                           std::strcmp(batch_env, "1") == 0;
+  LosslessProfileScope profile(LosslessProfileCurrent(), "ma.merge_dedup");
+  profile.Set("batch_merge", batch_merge);
+  profile.Set("input_entries", total_distinct);
+  profile.Set("weighted_samples", total_samples);
+  // The legacy table's resize retains old slot aliases. A new wave must
+  // rehash from empty slots so saturated weighted entries cannot be duplicated.
+  if (!fast_dedup_) dedup_table_.clear();
+  PrepareForSamples(total_distinct - previous_distinct);
+  for (auto& batch : batches) {
+    if (batch_merge) {
+      MergeSampleBatch(batch, 0, batch.NumDistinctSamples());
+      batch = TreeSamples(lossless_speedups_, fast_entropy_);
+      continue;
+    }
+    for (size_t a = 0; a < batch.NumDistinctSamples(); ++a) {
+      for (size_t p = 0; p < residuals.size(); ++p) {
+        residuals[p].push_back(batch.residuals[p][a]);
+      }
+      for (size_t p = 0; p < num_static_props; ++p) {
+        static_props[p].push_back(batch.static_props[p][a]);
+      }
+      for (size_t p = 0; p < props.size(); ++p) {
+        props[p].push_back(batch.props[p][a]);
+      }
+      sample_counts.push_back(batch.sample_counts[a]);
+      if (AddWeightedToTableAndMerge(sample_counts.size() - 1)) {
+        for (auto& r : residuals) r.pop_back();
+        for (size_t p = 0; p < num_static_props; ++p) static_props[p].pop_back();
+        for (auto& p : props) p.pop_back();
+        sample_counts.pop_back();
+      }
+    }
+    // Release each input as it is consumed, including its deduplication table.
+    batch = TreeSamples(lossless_speedups_, fast_entropy_);
+  }
+  num_samples = total_samples;
+  profile.Set("output_entries", NumDistinctSamples());
+  return true;
+}
+
+void TreeSamples::AddToTable(size_t a, size_t pos1, size_t pos2) {
   if (dedup_table_[pos1] == kDedupEntryUnused) {
     dedup_table_[pos1] = a;
   } else if (dedup_table_[pos2] == kDedupEntryUnused) {
@@ -900,6 +2314,7 @@ void TreeSamples::AddToTable(size_t a) {
 }
 
 void TreeSamples::PrepareForSamples(size_t extra_num_samples) {
+  FlushSampleBatch();
   const auto reserve = [&](auto& values) {
     size_t capacity = values.size() + extra_num_samples;
     if (lossless_speedups_ && capacity > values.capacity()) {
@@ -955,6 +2370,18 @@ size_t TreeSamples::Hash2(size_t a) const {
 }
 
 bool TreeSamples::IsSameSample(size_t a, size_t b) const {
+  if (fast_dedup_) {
+    for (const auto& r : residuals) {
+      if (r[a].tok != r[b].tok || r[a].nbits != r[b].nbits) return false;
+    }
+    for (size_t i = 0; i < num_static_props; ++i) {
+      if (static_props[i][a] != static_props[i][b]) return false;
+    }
+    for (const auto& p : props) {
+      if (p[a] != p[b]) return false;
+    }
+    return true;
+  }
   bool ret = true;
   for (const auto &r : residuals) {
     if (r[a].tok != r[b].tok) {
@@ -997,12 +2424,48 @@ void TreeSamples::AddSample(pixel_type_w pixel, const Properties &properties,
   }
   sample_counts.push_back(1);
   num_samples++;
+  if (sample_batching_) {
+    if (++pending_samples_ == 256) FlushSampleBatch();
+    return;
+  }
   if (AddToTableAndMerge(sample_counts.size() - 1)) {
     for (auto &r : residuals) r.pop_back();
     for (size_t i = 0; i < num_static_props; ++i) static_props[i].pop_back();
     for (auto &p : props) p.pop_back();
     sample_counts.pop_back();
   }
+}
+
+void TreeSamples::FlushSampleBatch() {
+  if (pending_samples_ == 0) return;
+  JXL_DASSERT(pending_samples_ <= 256);
+  const size_t begin = sample_counts.size() - pending_samples_;
+  std::array<uint64_t, 256> first, second;
+  HashBatch(begin, pending_samples_, first.data(), second.data());
+  size_t destination = begin;
+  // Hash the contiguous columns together, then merge in original sample order.
+  // Compaction only overwrites earlier rows; future rows and hashes stay valid.
+  for (size_t i = 0; i < pending_samples_; ++i) {
+    const size_t source = begin + i;
+    if (source != destination) {
+      for (auto& r : residuals) r[destination] = r[source];
+      for (size_t p = 0; p < num_static_props; ++p) {
+        static_props[p][destination] = static_props[p][source];
+      }
+      for (auto& p : props) p[destination] = p[source];
+      sample_counts[destination] = sample_counts[source];
+    }
+    if (!AddWeightedToTableAndMerge(destination, first[i], second[i])) {
+      ++destination;
+    }
+  }
+  for (auto& r : residuals) r.resize(destination);
+  for (size_t p = 0; p < num_static_props; ++p) {
+    static_props[p].resize(destination);
+  }
+  for (auto& p : props) p.resize(destination);
+  sample_counts.resize(destination);
+  pending_samples_ = 0;
 }
 
 void TreeSamples::Swap(size_t a, size_t b) {
@@ -1017,6 +2480,16 @@ void TreeSamples::Swap(size_t a, size_t b) {
     std::swap(p[a], p[b]);
   }
   std::swap(sample_counts[a], sample_counts[b]);
+}
+
+void TreeSamples::SwapBatch(const size_t* a, const size_t* b, size_t count) {
+  const auto swap_field = [&](auto& field) {
+    for (size_t i = 0; i < count; ++i) std::swap(field[a[i]], field[b[i]]);
+  };
+  for (auto& r : residuals) swap_field(r);
+  for (size_t i = 0; i < num_static_props; ++i) swap_field(static_props[i]);
+  for (auto& p : props) swap_field(p);
+  swap_field(sample_counts);
 }
 
 namespace {

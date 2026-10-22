@@ -128,6 +128,19 @@ target_link_libraries(jxl_dec-obj PUBLIC jxl_base)
 
 # Object library. This is used to hold the set of objects and properties.
 add_library(jxl_enc-obj OBJECT ${JPEGXL_INTERNAL_ENC_SOURCES})
+set(JPEGXL_EXPERIMENTAL_LIBSAIS_DIR "" CACHE PATH "Optional local libsais source for LZ77 experiments")
+if(JPEGXL_EXPERIMENTAL_LIBSAIS_DIR)
+  if(NOT EXISTS "${JPEGXL_EXPERIMENTAL_LIBSAIS_DIR}/src/libsais.c" OR
+     NOT EXISTS "${JPEGXL_EXPERIMENTAL_LIBSAIS_DIR}/include/libsais.h")
+    message(FATAL_ERROR "JPEGXL_EXPERIMENTAL_LIBSAIS_DIR must contain a libsais checkout")
+  endif()
+  target_sources(jxl_enc-obj PRIVATE "${JPEGXL_EXPERIMENTAL_LIBSAIS_DIR}/src/libsais.c")
+  set_source_files_properties(jxl/enc_lz77_suffix.cc PROPERTIES
+    COMPILE_DEFINITIONS JXL_EXPERIMENTAL_LIBSAIS=1
+    INCLUDE_DIRECTORIES "${JPEGXL_EXPERIMENTAL_LIBSAIS_DIR}/include")
+  set_source_files_properties("${JPEGXL_EXPERIMENTAL_LIBSAIS_DIR}/src/libsais.c" PROPERTIES
+    INCLUDE_DIRECTORIES "${JPEGXL_EXPERIMENTAL_LIBSAIS_DIR}/include")
+endif()
 target_compile_options(jxl_enc-obj PRIVATE ${JPEGXL_INTERNAL_FLAGS})
 target_compile_options(jxl_enc-obj PUBLIC ${JPEGXL_COVERAGE_FLAGS})
 set_property(TARGET jxl_enc-obj PROPERTY POSITION_INDEPENDENT_CODE ON)

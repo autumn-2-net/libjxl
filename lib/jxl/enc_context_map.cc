@@ -21,6 +21,7 @@
 #include "lib/jxl/enc_ans.h"
 #include "lib/jxl/enc_ans_params.h"
 #include "lib/jxl/enc_aux_out.h"
+#include "lib/jxl/enc_final_plan.h"
 #include "lib/jxl/entropy_coder.h"
 #include "lib/jxl/fields.h"
 #include "lib/jxl/pack_signed.h"
@@ -64,7 +65,41 @@ std::vector<uint8_t> MoveToFrontTransform(const std::vector<uint8_t>& v) {
 
 Status EncodeContextMap(const std::vector<uint8_t>& context_map,
                         size_t num_histograms, BitWriter* writer,
-                        LayerType layer, AuxOut* aux_out) {
+                        LayerType layer, AuxOut* aux_out,
+                        const HistogramParams* direct) {
+  if (direct) {
+    JXL_ENSURE(direct->direct_audit != nullptr);
+    ++direct->direct_audit->maps;
+    const size_t bits = CeilLog2Nonzero(num_histograms);
+    if (bits <= 3) {
+      return writer->WithMaxBits(3 + bits * context_map.size(), layer, aux_out,
+                                [&]() -> Status {
+        writer->Write(1, 1);
+        writer->Write(2, bits);
+        for (uint8_t c : context_map) writer->Write(bits, c);
+        return true;
+      });
+    }
+    // A fixed non-MTF representation; no dry encodes to compare alternatives.
+    auto params = *direct;
+    params.lz77_method = HistogramParams::LZ77Method::kNone;
+    params.uint_method = HistogramParams::HybridUintMethod::kContextMap;
+    params.direct_explicit_uint = false;
+    std::vector<std::vector<Token>> tokens(1);
+    for (uint8_t c : context_map) tokens[0].emplace_back(0, c);
+    return writer->WithMaxBits(2 + tokens[0].size() * 24, layer, aux_out,
+                              [&]() -> Status {
+      writer->Write(1, 0);
+      writer->Write(1, 0);
+      EntropyEncodingData codes;
+      JXL_ASSIGN_OR_RETURN(size_t cost, BuildAndEncodeHistograms(
+          writer->memory_manager(), params, 1, tokens, &codes, writer, layer,
+          aux_out));
+      (void)cost;
+      WriteTokens(tokens[0], codes, 0, writer);
+      return true;
+    });
+  }
   if (num_histograms == 1) {
     // Simple code
     writer->Write(1, 1);
@@ -85,8 +120,9 @@ Status EncodeContextMap(const std::vector<uint8_t>& context_map,
   }
   HistogramParams params;
   params.uint_method = HistogramParams::HybridUintMethod::kContextMap;
-  size_t ans_cost;
-  size_t mtf_cost;
+  size_t ans_cost = 0;
+  size_t mtf_cost = 0;
+  if (!ReplayingFinalPlan()) {
   {
     EntropyEncodingData codes;
     JXL_ASSIGN_OR_RETURN(
@@ -101,16 +137,25 @@ Status EncodeContextMap(const std::vector<uint8_t>& context_map,
                       memory_manager, params, 1, mtf_tokens, &codes, nullptr,
                       LayerType::Header, /*aux_out*/ nullptr));
   }
+  }
   bool use_mtf = mtf_cost < ans_cost;
+  size_t entry_bits = CeilLog2Nonzero(num_histograms);
+  size_t simple_cost = entry_bits * context_map.size();
+  bool simple = entry_bits < 4 && simple_cost < ans_cost && simple_cost < mtf_cost;
+  if (CurrentFinalPlan()) {
+    std::vector<int64_t> v{simple, use_mtf};
+    JXL_RETURN_IF_ERROR(FinalPlanExchange("map_mode", &v));
+    JXL_ENSURE(v.size() == 2 && v[0] >= 0 && v[0] <= 1 && v[1] >= 0 && v[1] <= 1);
+    simple = v[0]; use_mtf = v[1];
+    JXL_ENSURE(!simple || entry_bits < 4);
+  }
   // Rebuild token list.
   tokens[0].clear();
   for (size_t i = 0; i < transformed_symbols.size(); i++) {
     tokens[0].emplace_back(0,
                            use_mtf ? transformed_symbols[i] : context_map[i]);
   }
-  size_t entry_bits = CeilLog2Nonzero(num_histograms);
-  size_t simple_cost = entry_bits * context_map.size();
-  if (entry_bits < 4 && simple_cost < ans_cost && simple_cost < mtf_cost) {
+  if (simple) {
     JXL_RETURN_IF_ERROR(writer->WithMaxBits(
         3 + entry_bits * context_map.size(), layer, aux_out, [&] {
           writer->Write(1, 1);
@@ -139,7 +184,7 @@ Status EncodeContextMap(const std::vector<uint8_t>& context_map,
 }
 
 Status EncodeBlockCtxMap(const BlockCtxMap& block_ctx_map, BitWriter* writer,
-                         AuxOut* aux_out) {
+                         AuxOut* aux_out, const HistogramParams* direct) {
   const auto& dct = block_ctx_map.dc_thresholds;
   const auto& qft = block_ctx_map.qf_thresholds;
   const auto& ctx_map = block_ctx_map.ctx_map;
@@ -167,7 +212,8 @@ Status EncodeBlockCtxMap(const BlockCtxMap& block_ctx_map, BitWriter* writer,
           JXL_RETURN_IF_ERROR(U32Coder::Write(kQFThresholdDist, i - 1, writer));
         }
         JXL_RETURN_IF_ERROR(EncodeContextMap(ctx_map, block_ctx_map.num_ctxs,
-                                             writer, LayerType::Ac, aux_out));
+                                             writer, LayerType::Ac, aux_out,
+                                             direct));
         return true;
       });
 }

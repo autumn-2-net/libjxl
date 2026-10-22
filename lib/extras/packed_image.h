@@ -227,6 +227,11 @@ class PackedPixelFile {
 
   JxlBitDepth input_bitdepth = {JXL_BIT_DEPTH_FROM_PIXEL_FORMAT, 0, 0};
 
+  // Minimum precision for exact stored samples. PNG starts with storage bits
+  // and only accepts a significance hint after verifying every stored sample.
+  uint32_t lossless_color_bits = 0;
+  uint32_t lossless_alpha_bits = 0;
+
   std::unique_ptr<PackedFrame> preview_frame;
   std::vector<PackedFrame> frames;
   mutable std::vector<ChunkedPackedFrame> chunked_frames;

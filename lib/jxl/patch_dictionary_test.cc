@@ -41,6 +41,25 @@ using ::jxl::test::GetImage;
 using ::jxl::test::ReadTestData;
 using ::jxl::test::Roundtrip;
 
+TEST(PatchDictionaryTest, CompactQuantizedPatch) {
+  QuantizedPatch small(6), full;
+  small.xsize = full.xsize = 3;
+  small.ysize = full.ysize = 2;
+  for (size_t c = 0; c < 3; ++c) {
+    EXPECT_EQ(small.pixels[c].size(), 6u);
+    EXPECT_EQ(small.fpixels[c].size(), 6u);
+    for (size_t i = 0; i < 6; ++i) {
+      small.pixels[c][i] = full.pixels[c][i] = static_cast<int8_t>(i + c);
+    }
+  }
+  EXPECT_TRUE(small == full);
+  EXPECT_FALSE(small < full);
+  EXPECT_FALSE(full < small);
+  small.pixels[2][5] = 99;
+  EXPECT_FALSE(small == full);
+  EXPECT_NE(small < full, full < small);
+}
+
 TEST(PatchDictionaryTest, GrayscaleModular) {
   const std::vector<uint8_t> orig = ReadTestData("jxl/grayscale_patches.png");
   extras::PackedPixelFile ppf;

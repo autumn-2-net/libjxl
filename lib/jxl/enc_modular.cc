@@ -4,6 +4,14 @@
 // license that can be found in the LICENSE file.
 
 #include "lib/jxl/enc_modular.h"
+#include "lib/jxl/enc_lossless_profile.h"
+#include "lib/jxl/enc_lossless_probe_pool.h"
+#include "lib/jxl/enc_lossless_workers.h"
+#include "lib/jxl/modular/encoding/enc_predict.h"
+#include "lib/jxl/enc_ma_search.h"
+#include "lib/jxl/enc_ma_tree_groups.h"
+#include "lib/jxl/enc_neural_plan.h"
+#include "lib/jxl/enc_final_plan.h"
 
 #include <jxl/cms_interface.h>
 #include <jxl/memory_manager.h>
@@ -58,6 +66,7 @@
 #include "lib/jxl/modular/encoding/dec_ma.h"
 #include "lib/jxl/modular/encoding/enc_encoding.h"
 #include "lib/jxl/modular/encoding/enc_ma.h"
+#include "lib/jxl/modular/encoding/enc_ma_histograms.h"
 #include "lib/jxl/modular/encoding/encoding.h"
 #include "lib/jxl/modular/encoding/ma_common.h"
 #include "lib/jxl/modular/modular_image.h"
@@ -264,9 +273,27 @@ Status float_to_int(const float* const row_in, pixel_type* const row_out,
   return true;
 }
 
-float EstimateWPCost(const Image& img, size_t i) {
+struct WPCostWork {
+  size_t pixels = 0;
+  size_t pruned_modes = 0;
+  size_t checkpoints = 0;
+};
+
+float EstimateWPCost(const Image& img, size_t i, float cost_limit,
+                     WPCostWork* work, bool lossless,
+                     size_t selected_channel = SIZE_MAX) {
+  const char* flat_env = std::getenv("JXL_LOSSLESS_WP_FLAT");
+  const bool flat = lossless && flat_env &&
+      (std::strcmp(flat_env, "1") == 0 || std::strcmp(flat_env, "3") == 0);
   size_t extra_bits = 0;
   float histo_cost = 0;
+  size_t total_pixels = 0;
+  for (const auto& ch : img.channel) total_pixels += ch.w * ch.h;
+  // Prefix entropy is monotone in exact arithmetic. Leave a generous margin
+  // for the float entropy estimator; never prune on a near tie.
+  const double bound_margin = 16.0 + total_pixels * 0.001;
+  const bool bounded = std::isfinite(cost_limit) &&
+      cost_limit < std::numeric_limits<float>::max() && total_pixels >= 65536;
   HybridUintConfig config;
   int32_t cutoffs[] = {-500, -392, -255, -191, -127, -95, -63, -47, -31,
                        -23,  -15,  -11,  -7,   -4,   -3,  -1,  0,   1,
@@ -276,7 +303,9 @@ float EstimateWPCost(const Image& img, size_t i) {
   Histogram histo[nc] = {};
   weighted::Header wp_header;
   PredictorMode(i, &wp_header);
-  for (const Channel& ch : img.channel) {
+  for (size_t c = 0; c < img.channel.size(); ++c) {
+    if (selected_channel != SIZE_MAX && c != selected_channel) continue;
+    const Channel& ch = img.channel[c];
     const ptrdiff_t onerow = ch.plane.PixelsPerRow();
     weighted::State wp_state(wp_header, ch.w, ch.h);
     Properties properties(1);
@@ -291,9 +320,11 @@ float EstimateWPCost(const Image& img, size_t i) {
         pixel_type_w topright =
             (x + 1 < ch.w && y ? *(r + x + 1 - onerow) : top);
         pixel_type_w toptop = (y > 1 ? *(r + x - onerow - onerow) : top);
-        pixel_type guess = wp_state.Predict</*compute_properties=*/true>(
-            x, y, ch.w, top, left, topright, topleft, toptop, &properties,
-            offset);
+        pixel_type guess = flat
+            ? PredictWeightedFlat<true>(&wp_state, x, y, ch.w, top, left,
+                                         topright, topleft, toptop, &properties, offset)
+            : wp_state.Predict<true>(x, y, ch.w, top, left, topright, topleft,
+                                     toptop, &properties, offset);
         size_t ctx = 0;
         for (int c : cutoffs) {
           ctx += (c >= properties[0]) ? 1 : 0;
@@ -307,6 +338,16 @@ float EstimateWPCost(const Image& img, size_t i) {
         histo[ctx].Add(token);
         extra_bits += nbits;
         wp_state.UpdateErrors(r[x], x, y, ch.w);
+      }
+      work->pixels += ch.w;
+      if (bounded && (y & 63) == 63) {
+        double lower_bound = histo_cost + static_cast<double>(extra_bits);
+        for (const auto& h : histo) lower_bound += h.ShannonEntropy();
+        ++work->checkpoints;
+        if (lower_bound > cost_limit + bound_margin) {
+          ++work->pruned_modes;
+          return std::numeric_limits<float>::max();
+        }
       }
     }
     if (unhealthy) {
@@ -333,6 +374,112 @@ bool do_transform(Image& image, const Transform& tr,
   }
   if (did_it) image.transform.push_back(t);
   return did_it;
+}
+
+Status FinalTransforms(Image& image, size_t start) {
+  if (!CurrentFinalPlan()) return true;
+  std::vector<int64_t> values;
+  if (!ReplayingFinalPlan()) {
+    for (size_t i = start; i < image.transform.size(); ++i) {
+      const auto& t = image.transform[i];
+      if (t.id == TransformId::kSqueeze || t.lossy_palette) {
+        CurrentFinalPlan()->unsupported = "squeeze or lossy palette";
+        return true;
+      }
+      values.insert(values.end(), {static_cast<int>(t.id), t.begin_c,
+          t.id == TransformId::kRCT ? t.rct_type : 0,
+          t.id == TransformId::kPalette ? t.num_c : 0,
+          t.id == TransformId::kPalette ? t.nb_colors : 0,
+          t.id == TransformId::kPalette ? static_cast<int>(t.predictor) : 0,
+          t.ordered_palette});
+    }
+  }
+  JXL_RETURN_IF_ERROR(FinalPlanExchange("transforms", &values));
+  if (!ReplayingFinalPlan()) return true;
+  JXL_ENSURE(values.size() % 7 == 0 && values.size() <= 7 * 512);
+  for (size_t i = 0; i < values.size(); i += 7) {
+    JXL_ENSURE(values[i] >= 0 && values[i] <= 1 && values[i + 1] >= 0 &&
+        static_cast<size_t>(values[i + 1]) < image.channel.size() &&
+        values[i + 2] >= 0 && values[i + 2] < 42 && values[i + 3] >= 0 &&
+        static_cast<size_t>(values[i + 3]) <= image.channel.size() &&
+        values[i + 4] >= 0 && values[i + 4] <= 65536 &&
+        values[i + 5] >= 0 && values[i + 5] < 14 &&
+        values[i + 6] >= 0 && values[i + 6] <= 1);
+    Transform t(static_cast<TransformId>(values[i]));
+    t.begin_c = values[i + 1];
+    t.rct_type = values[i + 2];
+    t.num_c = values[i + 3];
+    t.nb_colors = values[i + 4];
+    t.predictor = static_cast<Predictor>(values[i + 5]);
+    t.ordered_palette = values[i + 6];
+    t.lossy_palette = false;
+    JXL_ENSURE(t.begin_c + (t.id == TransformId::kRCT ? 3 : t.num_c) <=
+               image.channel.size());
+    JXL_ENSURE(t.id != TransformId::kPalette || t.num_c > 0);
+    JXL_ENSURE(do_transform(image, t, weighted::Header()));
+  }
+  return true;
+}
+
+Status FinalTree(Tree* tree) {
+  if (!CurrentFinalPlan()) return true;
+  std::vector<int64_t> values;
+  if (!ReplayingFinalPlan() && !tree->empty()) {
+    std::vector<size_t> queue{0};
+    for (size_t i = 0; i < queue.size(); ++i) {
+      JXL_ENSURE(queue.size() <= tree->size() && queue[i] < tree->size());
+      const auto& n = (*tree)[queue[i]];
+      values.insert(values.end(), {n.property,
+          n.property < 0 ? n.predictor_offset : n.splitval,
+          n.property < 0 ? static_cast<int>(n.predictor) : 0,
+          n.property < 0 ? n.multiplier : 1});
+      if (n.property >= 0) { queue.push_back(n.lchild); queue.push_back(n.rchild); }
+    }
+  }
+  JXL_RETURN_IF_ERROR(FinalPlanExchange("tree", &values));
+  if (!ReplayingFinalPlan()) return true;
+  const size_t count = values.size() / 4;
+  JXL_ENSURE(values.size() % 4 == 0 && count > 0 && count % 2 == 1 &&
+             count <= CurrentFinalPlan()->tree_limit);
+  tree->clear();
+  size_t next = 1;
+  for (size_t i = 0; i < count; ++i) {
+    const auto* v = values.data() + 4 * i;
+    JXL_ENSURE(i < next && v[0] >= -1 && v[0] < 256 &&
+               v[1] >= INT32_MIN && v[1] <= INT32_MAX);
+    if (v[0] == -1) {
+      JXL_ENSURE(v[2] >= 0 && v[2] < 14 && v[3] > 0 && v[3] < (1LL << 31));
+      tree->push_back(PropertyDecisionNode::Leaf(static_cast<Predictor>(v[2]), v[1], v[3]));
+    } else {
+      JXL_ENSURE(v[2] == 0 && v[3] == 1 && next + 2 <= count);
+      tree->push_back(PropertyDecisionNode::Split(v[0], v[1], next));
+      next += 2;
+    }
+  }
+  JXL_ENSURE(next == count);
+  struct Visit { size_t index; int stage; int32_t lo, hi; };
+  std::array<std::pair<int32_t, int32_t>, 256> ranges;
+  for (auto& range : ranges) range = {INT32_MIN, INT32_MAX};
+  std::vector<Visit> stack{{0, 0, 0, 0}};
+  while (!stack.empty()) {
+    JXL_ENSURE(stack.size() < 2048);
+    auto& item = stack.back();
+    const auto& n = (*tree)[item.index];
+    if (n.property < 0) { stack.pop_back(); continue; }
+    auto& range = ranges[n.property];
+    if (item.stage == 0) {
+      JXL_ENSURE(range.first <= n.splitval && n.splitval < range.second);
+      item.lo = range.first; item.hi = range.second; item.stage = 1;
+      range.first = n.splitval + 1;
+      stack.push_back({n.lchild, 0, 0, 0});
+    } else if (item.stage == 1) {
+      range = {item.lo, n.splitval}; item.stage = 2;
+      stack.push_back({n.rchild, 0, 0, 0});
+    } else {
+      range = {item.lo, item.hi}; stack.pop_back();
+    }
+  }
+  return true;
 }
 
 StatusOr<bool> maybe_do_transform(Image& image, const Transform& tr,
@@ -364,12 +511,34 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
                     const CompressParams& cparams_,
                     float channel_colors_percent,
                     jxl::ThreadPool* pool = nullptr) {
+  if (auto* audit = cparams_.options.histogram_params.direct_audit) {
+    if (cparams_.palette_colors > 0 && !gi.channel.empty()) {
+      ++audit->palette_attempts;
+      Transform palette(TransformId::kPalette);
+      palette.begin_c = gi.nb_meta_channels;
+      palette.num_c = gi.channel.size() - gi.nb_meta_channels;
+      palette.nb_colors = cparams_.palette_colors;
+      palette.ordered_palette = true;
+      palette.lossy_palette = false;
+      palette.lossless_encoder_tools = cparams_.IsLossless() && cparams_.modular_mode;
+      palette.predictor = Predictor::Zero;
+      if (palette.num_c > 0 && do_transform(gi, palette, weighted::Header(), pool)) {
+        ++audit->palette_applied;
+      }
+    }
+    return true;
+  }
   float cost_before = 0.f;
   size_t did_palette = 0;
   float nb_pixels = gi.channel[0].w * gi.channel[0].h;
   int nb_chans = gi.channel.size() - gi.nb_meta_channels;
   // arbitrary estimate: 4.8 bpp for 8-bit RGB
   float arbitrary_bpp_estimate = 0.2f * gi.bitdepth * nb_chans;
+  const char* palette_force_env = std::getenv("JXL_LOSSLESS_PALETTE_FORCE");
+  const bool force_palette = cparams_.IsLossless() && cparams_.modular_mode &&
+      !cparams_.lossy_palette && cparams_.palette_colors > 0 &&
+      cparams_.palette_colors <= 65536 && palette_force_env &&
+      std::strcmp(palette_force_env, "1") == 0;
 
   if (cparams_.palette_colors != 0 || cparams_.lossy_palette) {
     // when not estimating, assume some arbitrary bpp
@@ -393,7 +562,9 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
       maybe_palette.nb_colors = std::min(
           static_cast<int>(cost_before * 0.0005f + nb_pixels / 128 + 128),
           std::abs(cparams_.palette_colors));
+      if (force_palette) maybe_palette.nb_colors = cparams_.palette_colors;
       maybe_palette.ordered_palette = cparams_.palette_colors >= 0;
+      maybe_palette.lossless_encoder_tools = cparams_.IsLossless() && cparams_.modular_mode;
       maybe_palette.lossy_palette =
           (cparams_.lossy_palette && maybe_palette.num_c == 3);
       if (maybe_palette.lossy_palette) {
@@ -401,10 +572,14 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
       }
       // TODO(veluca): use a custom weighted header if using the weighted
       // predictor.
-      JXL_ASSIGN_OR_RETURN(
-          did_palette,
-          maybe_do_transform(gi, maybe_palette, cparams_, weighted::Header(),
-                             cost_before, pool, cparams_.options.zero_tokens));
+      if (force_palette) {
+        did_palette = do_transform(gi, maybe_palette, weighted::Header(), pool);
+      } else {
+        JXL_ASSIGN_OR_RETURN(
+            did_palette,
+            maybe_do_transform(gi, maybe_palette, cparams_, weighted::Header(),
+                               cost_before, pool, cparams_.options.zero_tokens));
+      }
     }
     // all-minus-one-channel palette (RGB with separate alpha, or CMY with
     // separate K)
@@ -415,15 +590,21 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
       maybe_palette_3.nb_colors = std::min(
           static_cast<int>(cost_before * 0.0005f + nb_pixels / 128 + 128),
           std::abs(cparams_.palette_colors));
+      if (force_palette) maybe_palette_3.nb_colors = cparams_.palette_colors;
       maybe_palette_3.ordered_palette = cparams_.palette_colors >= 0;
+      maybe_palette_3.lossless_encoder_tools = cparams_.IsLossless() && cparams_.modular_mode;
       maybe_palette_3.lossy_palette = cparams_.lossy_palette;
       if (maybe_palette_3.lossy_palette) {
         maybe_palette_3.predictor = Predictor::Average4;
       }
-      JXL_ASSIGN_OR_RETURN(
-          did_palette,
-          maybe_do_transform(gi, maybe_palette_3, cparams_, weighted::Header(),
-                             cost_before, pool, cparams_.options.zero_tokens));
+      if (force_palette) {
+        did_palette = do_transform(gi, maybe_palette_3, weighted::Header(), pool);
+      } else {
+        JXL_ASSIGN_OR_RETURN(
+            did_palette,
+            maybe_do_transform(gi, maybe_palette_3, cparams_, weighted::Header(),
+                               cost_before, pool, cparams_.options.zero_tokens));
+      }
     }
   }
 
@@ -478,10 +659,12 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
 
 StatusOr<std::unique_ptr<ModularFrameEncoder>> ModularFrameEncoder::Create(
     JxlMemoryManager* memory_manager, const FrameHeader& frame_header,
-    const CompressParams& cparams_orig, bool streaming_mode) {
+    const CompressParams& cparams_orig, bool streaming_mode,
+    bool jpeg_transcode) {
   auto self = std::unique_ptr<ModularFrameEncoder>(
       new ModularFrameEncoder(memory_manager));
-  JXL_RETURN_IF_ERROR(self->Init(frame_header, cparams_orig, streaming_mode));
+  JXL_RETURN_IF_ERROR(
+      self->Init(frame_header, cparams_orig, streaming_mode, jpeg_transcode));
   return self;
 }
 
@@ -490,14 +673,32 @@ ModularFrameEncoder::ModularFrameEncoder(JxlMemoryManager* memory_manager)
 
 Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
                                  const CompressParams& cparams_orig,
-                                 bool streaming_mode) {
+                                 bool streaming_mode, bool jpeg_transcode) {
   frame_dim_ = frame_header.ToFrameDimensions();
   cparams_ = cparams_orig;
-  cparams_.options.lossless_tree_speedups =
-      cparams_.modular_mode && cparams_.IsLossless();
+  const bool lossless_pixels = cparams_.modular_mode && cparams_.IsLossless();
+  const char* jpeg_ma = std::getenv("JXL_LOSSLESS_JPEG_MA_SPEEDUPS");
+  // JPEG's integer auxiliary streams can use exact MA cost/count reuse too.
+  // Do not infer JPEG input from VarDCT mode, which also covers lossy images.
+  cparams_.options.lossless_tree_speedups = lossless_pixels ||
+      (jpeg_transcode && (!jpeg_ma || std::strcmp(jpeg_ma, "1") == 0));
+  const auto* metadata = frame_header.nonserialized_metadata;
+  cparams_.options.lossless_channel_trees = lossless_pixels && !jpeg_transcode && metadata &&
+      metadata->m.bit_depth.bits_per_sample <= 8 &&
+      metadata->m.bit_depth.exponent_bits_per_sample == 0 &&
+      std::all_of(metadata->m.extra_channel_info.begin(), metadata->m.extra_channel_info.end(),
+          [](const ExtraChannelInfo& channel) {
+            return channel.bit_depth.bits_per_sample <= 8 &&
+                   channel.bit_depth.exponent_bits_per_sample == 0;
+          });
+  const char* final_channel = std::getenv("JXL_MA_CHANNEL_FINAL_ONLY");
+  if (final_channel && std::strcmp(final_channel, "1") == 0 &&
+      (cparams_.lossless_disposable_probe || cparams_.speed_tier > SpeedTier::kTortoise)) {
+    cparams_.options.lossless_channel_trees = false;
+  }
   const char* fast_entropy = std::getenv("JXL_LOSSLESS_FAST_ENTROPY");
   cparams_.options.lossless_fast_entropy =
-      cparams_.options.lossless_tree_speedups &&
+      lossless_pixels &&
       fast_entropy && std::strcmp(fast_entropy, "1") == 0;
 
   size_t num_streams =
@@ -710,6 +911,8 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
   cparams_.options.max_chan_size = frame_dim_.group_dim;
   cparams_.options.group_dim = frame_dim_.group_dim;
 
+  ApplyMaSearchSettings(&cparams_.options);
+
   // TODO(veluca): figure out how to use different predictor sets per channel.
   stream_options_.resize(num_streams, cparams_.options);
 
@@ -732,6 +935,8 @@ Status ModularFrameEncoder::ComputeEncodingData(
     const JxlCmsInterface& cms, ThreadPool* pool, AuxOut* aux_out,
     bool do_color) {
   LosslessStageTimer timer(cparams_, frame_dim_, "transforms");
+  LosslessProfileScope profile(cparams_.options.histogram_params.lossless_profile,
+                               "modular.transforms");
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
   JXL_DEBUG_V(6, "Computing modular encoding data for frame %s",
               frame_header.DebugString().c_str());
@@ -923,6 +1128,9 @@ Status ModularFrameEncoder::ComputeEncodingData(
     cparams_.lossy_palette = false;
   }
 
+  if (!ReplayingFinalPlan()) {
+  // Speculative transform costs are not final decisions.
+  FinalPlanScope suspend(nullptr);
   // Global palette transforms
   float channel_colors_percent = 0;
   if (!cparams_.lossy_palette &&
@@ -1014,6 +1222,16 @@ Status ModularFrameEncoder::ComputeEncodingData(
     cparams_.colorspace = 0;
   }
   JXL_ENSURE(max_bitdepth <= level_max_bitdepth);
+  }
+  if (CurrentFinalPlan()) {
+    JXL_RETURN_IF_ERROR(FinalTransforms(gi, 0));
+    std::vector<int64_t> state{max_bitdepth, maxval, cparams_.colorspace};
+    JXL_RETURN_IF_ERROR(FinalPlanExchange("global_state", &state));
+    JXL_ENSURE(state.size() == 3 && state[0] >= 0 && state[0] <= 32 &&
+               state[1] >= INT32_MIN && state[1] <= INT32_MAX &&
+               state[2] >= -1 && state[2] < 42);
+    max_bitdepth = state[0]; maxval = state[1]; cparams_.colorspace = state[2];
+  }
 
   if (!cparams_.ModularPartIsLossless()) {
     quants_.resize(gi.channel.size(), 1);
@@ -1115,6 +1333,16 @@ Status ModularFrameEncoder::ComputeEncodingData(
   }
   gi_channel_.resize(stream_images_.size());
 
+  const char* wp_parallel_env = std::getenv("JXL_LOSSLESS_WP_PARALLEL");
+  const bool parallel_wp = pool && cparams_.IsLossless() &&
+      cparams_.modular_mode && frame_dim_.num_groups == 1 && !CurrentFinalPlan() &&
+      wp_parallel_env && std::strcmp(wp_parallel_env, "1") == 0;
+  const bool wave_wp = pool && cparams_.IsLossless() &&
+      cparams_.modular_mode && !CurrentFinalPlan() &&
+      wp_parallel_env && (std::strcmp(wp_parallel_env, "2") == 0 ||
+                          std::strcmp(wp_parallel_env, "3") == 0);
+  std::vector<size_t> wp_modes(wave_wp ? stream_images_.size() : 0);
+
   const auto process_row = [&](const uint32_t i,
                                size_t /* thread */) -> Status {
     size_t stream = stream_params_[i].id.ID(frame_dim_);
@@ -1123,12 +1351,22 @@ Status ModularFrameEncoder::ComputeEncodingData(
     }
     JXL_RETURN_IF_ERROR(PrepareStreamParams(
         stream_params_[i].rect, cparams_, stream_params_[i].minShift,
-        stream_params_[i].maxShift, stream_params_[i].id, do_color, groupwise));
+        stream_params_[i].maxShift, stream_params_[i].id, do_color, groupwise,
+        parallel_wp ? pool : nullptr, wave_wp ? &wp_modes[stream] : nullptr));
     return true;
   };
-  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, stream_params_.size(),
-                                ThreadPool::NoInit, process_row,
-                                "ChooseParams"));
+  if (parallel_wp) {
+    // A single image group cannot use group parallelism. Its predictor modes
+    // are independent, so lend the pool to their search without nesting it.
+    for (size_t i = 0; i < stream_params_.size(); ++i) {
+      JXL_RETURN_IF_ERROR(process_row(static_cast<uint32_t>(i), 0));
+    }
+  } else {
+    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, stream_params_.size(),
+                                  ThreadPool::NoInit, process_row,
+                                  "ChooseParams"));
+  }
+  if (wave_wp) JXL_RETURN_IF_ERROR(PrepareWPModes(wp_modes, pool));
   {
     // Clear out channels that have been copied to groups.
     Image& full_image = stream_images_[0];
@@ -1148,7 +1386,16 @@ Status ModularFrameEncoder::ComputeEncodingData(
 }
 
 Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
+  if (auto* audit = cparams_.options.histogram_params.direct_audit) {
+    ++audit->trees;
+    if (cparams_.custom_fixed_tree.empty() && !audit->allow_ma_learning) {
+      ++audit->forbidden_searches;
+      return JXL_FAILURE("Direct plan requires an explicit MA tree");
+    }
+  }
   LosslessStageTimer timer(cparams_, frame_dim_, "tree");
+  LosslessProfileScope profile(cparams_.options.histogram_params.lossless_profile,
+                               "modular.tree");
   std::vector<ModularMultiplierInfo> multiplier_info;
   if (!quants_.empty()) {
     for (uint32_t stream_id = 0; stream_id < stream_images_.size();
@@ -1206,7 +1453,17 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
     multiplier_info.resize(new_num);
   }
 
-  if (!cparams_.custom_fixed_tree.empty()) {
+  if (cparams_.options.histogram_params.direct_audit) {
+    const char* samples = std::getenv("JXL_DIRECT_SAMPLES");
+    const char* policy = std::getenv("JXL_DIRECT_POLICY");
+    if (samples && *samples && policy && std::strcmp(policy, "neural") == 0) {
+      JXL_RETURN_IF_ERROR(ExportNeuralTreeSamples(
+          stream_images_.data(), stream_options_.data(), stream_images_.size(), samples));
+    }
+  }
+  if (ReplayingFinalPlan()) {
+    JXL_RETURN_IF_ERROR(FinalTree(&tree_));
+  } else if (!cparams_.custom_fixed_tree.empty()) {
     tree_ = cparams_.custom_fixed_tree;
   } else if (cparams_.speed_tier < SpeedTier::kFalcon ||
              !cparams_.modular_mode) {
@@ -1228,10 +1485,62 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
     if (useful_splits.empty()) return true;
     useful_splits.push_back(tree_splits_.back());
 
+    const char* shard_env = std::getenv("JXL_MA_TREE_SHARDS");
+    const size_t requested_shards = shard_env && shard_env[0] && shard_env[1] == '\0' &&
+        (shard_env[0] == '2' || shard_env[0] == '4' || shard_env[0] == '8')
+        ? static_cast<size_t>(shard_env[0] - '0') : 1;
+    // Experimental independent learners, not a faster replay of the same tree.
+    // Keep JPEG, lossy and model/audit paths on their original partitioning.
+    if (requested_shards > 1 && useful_splits.size() == 2 &&
+        cparams_.modular_mode && cparams_.IsLossless() &&
+        !cparams_.options.ma_search &&
+        !cparams_.options.histogram_params.direct_audit &&
+        stream_options_[useful_splits.front()].tree_kind ==
+            ModularOptions::TreeKind::kLearn) {
+      const size_t first = useful_splits.front();
+      std::vector<uint64_t> work(useful_splits.back() - first);
+      for (size_t i = first; i < useful_splits.back(); ++i) {
+        const Image& image = stream_images_[i];
+        for (size_t c = 0; c < image.channel.size(); ++c) {
+          const Channel& channel = image.channel[c];
+          if (c >= image.nb_meta_channels &&
+              (channel.w > stream_options_[i].max_chan_size ||
+               channel.h > stream_options_[i].max_chan_size)) break;
+          work[i - first] += static_cast<uint64_t>(channel.w) * channel.h;
+        }
+      }
+      useful_splits = MaTreeGroupBoundaries(work, requested_shards);
+      for (size_t& boundary : useful_splits) boundary += first;
+    }
+    profile.Set("requested_tree_shards", requested_shards);
+    profile.Set("tree_chunks", useful_splits.size() - 1);
+
+    const char* split_env = std::getenv("JXL_MA_SPLIT_PARALLEL");
+    const char* gather_env = std::getenv("JXL_MA_GATHER_PARALLEL");
+    const bool single_parallel_learner =
+        pool && useful_splits.size() == 2 && cparams_.modular_mode &&
+        cparams_.IsLossless() && !cparams_.options.ma_search &&
+        !cparams_.options.histogram_params.direct_audit;
+    const bool parallel_split = single_parallel_learner &&
+        split_env && std::strcmp(split_env, "1") == 0;
+    const bool parallel_gather = single_parallel_learner &&
+        gather_env && std::strcmp(gather_env, "1") == 0;
+    const char* chunks_env = std::getenv("JXL_MA_CHUNK_PARALLEL");
+    // Init enables these speedups for VarDCT only with actual JPEG input.
+    const bool cooperative_chunks = pool && useful_splits.size() > 2 &&
+        !cparams_.modular_mode &&
+        cparams_.options.lossless_tree_speedups && !cparams_.options.ma_search &&
+        !cparams_.options.histogram_params.direct_audit && !CurrentFinalPlan() &&
+        split_env && std::strcmp(split_env, "1") == 0 &&
+        (!chunks_env || std::strcmp(chunks_env, "1") == 0);
+    profile.Set("parallel_split", parallel_split);
+    profile.Set("parallel_gather", parallel_gather);
+    profile.Set("cooperative_chunks", cooperative_chunks);
+
     std::vector<Tree> trees(useful_splits.size() - 1);
-    const auto process_chunk = [&](const uint32_t chunk,
-                                   size_t /* thread */) -> Status {
-      // TODO(veluca): parallelize more.
+    const auto process_chunk = [&](size_t chunk, ThreadPool* split_pool) -> Status {
+      LosslessProfileScope chunk_profile(profile.Id(), "modular.tree_chunk");
+      chunk_profile.Set("chunk", chunk);
       uint32_t start = useful_splits[chunk];
       uint32_t stop = useful_splits[chunk + 1];
       while (start < stop && stream_images_[start].empty()) ++start;
@@ -1242,7 +1551,8 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
         JXL_ASSIGN_OR_RETURN(
             trees[chunk],
             LearnTree(stream_images_.data(), stream_options_.data(), start,
-                      stop, multiplier_info));
+                      stop, multiplier_info, split_pool,
+                      parallel_gather ? pool : nullptr));
       } else {
         size_t total_pixels = 0;
         for (size_t i = start; i < stop; i++) {
@@ -1257,9 +1567,26 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
       }
       return true;
     };
-    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, useful_splits.size() - 1,
-                                  ThreadPool::NoInit, process_chunk,
-                                  "LearnTrees"));
+    if (cooperative_chunks) {
+      // Multiple learners share the caller's workers without reentering its
+      // runner. Preserve chunk boundaries, sample collection and multipliers.
+      const auto limits = LosslessWorkerLimits::FromEnvironment();
+      LosslessProbePool arena;
+      JXL_RETURN_IF_ERROR(arena.Run(
+          trees.size(), pool, limits.tasks,
+          limits.Tasks(trees.size(), MaHistogramBudget::kLimit), process_chunk));
+    } else if (parallel_split || parallel_gather) {
+      // The single learner owns the pool for its property searches. Never
+      // invoke it inside a pool task: JxlParallelRunner is not reentrant.
+      JXL_RETURN_IF_ERROR(process_chunk(0, parallel_split ? pool : nullptr));
+    } else {
+      JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, useful_splits.size() - 1,
+                                    ThreadPool::NoInit,
+                                    [&](uint32_t chunk, size_t) -> Status {
+                                      return process_chunk(chunk, nullptr);
+                                    },
+                                    "LearnTrees"));
+    }
     tree_.clear();
     JXL_RETURN_IF_ERROR(
         MergeTrees(trees, useful_splits, 0, useful_splits.size() - 1, &tree_));
@@ -1285,11 +1612,17 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
     }
   }
   tree_tokens_.resize(1);
+  if (!ReplayingFinalPlan()) JXL_RETURN_IF_ERROR(FinalTree(&tree_));
   tree_tokens_[0].clear();
   Tree decoded_tree;
   JXL_RETURN_IF_ERROR(TokenizeTree(tree_, tree_tokens_.data(), &decoded_tree));
   JXL_ENSURE(tree_.size() == decoded_tree.size());
   tree_ = std::move(decoded_tree);
+  if (auto* audit = cparams_.options.histogram_params.direct_audit) {
+    audit->tree_nodes = tree_.size();
+    const char* path = std::getenv("JXL_DIRECT_TREE_OUT");
+    if (path && *path) JXL_RETURN_IF_ERROR(WriteNeuralTreeFile(path, tree_));
+  }
 
   /* TODO(szabadka) Add text output callback to cparams
   if (kPrintTree && WantDebugOutput(aux_out)) {
@@ -1305,28 +1638,61 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
 
 Status ModularFrameEncoder::ComputeTokens(ThreadPool* pool) {
   LosslessStageTimer timer(cparams_, frame_dim_, "tokens");
+  LosslessProfileScope profile(cparams_.options.histogram_params.lossless_profile,
+                               "modular.tokens");
   size_t num_streams = stream_images_.size();
   stream_headers_.resize(num_streams);
   tokens_.resize(num_streams);
   image_widths_.resize(num_streams);
+  const char* channel_env = std::getenv("JXL_LOSSLESS_TOKEN_PARALLEL");
+  bool parallel_channels = pool && cparams_.IsLossless() && cparams_.modular_mode &&
+      !CurrentFinalPlan() && channel_env && std::strcmp(channel_env, "1") == 0;
+  if (parallel_channels) {
+    size_t total = 0, largest = 0;
+    for (size_t stream = 0; stream < num_streams; ++stream) {
+      size_t count = 0;
+      const auto& image = stream_images_[stream];
+      for (size_t c = 0; c < image.channel.size(); ++c) {
+        const auto& ch = image.channel[c];
+        if (c >= image.nb_meta_channels &&
+            (ch.w > stream_options_[stream].max_chan_size ||
+             ch.h > stream_options_[stream].max_chan_size)) break;
+        count += ch.w * ch.h;
+      }
+      total += count;
+      largest = std::max(largest, count);
+    }
+    parallel_channels = largest >= 65536 && largest >= total - total / 4;
+  }
   const auto process_stream = [&](const uint32_t stream_id,
                                   size_t /* thread */) -> Status {
+    LosslessProfileScope stream_profile(profile.Id(), "modular.token_stream");
+    stream_profile.Set("stream", stream_id);
     tokens_[stream_id].clear();
     JXL_RETURN_IF_ERROR(
         ModularCompress(stream_images_[stream_id], stream_options_[stream_id],
                         stream_id, tree_, stream_headers_[stream_id],
-                        tokens_[stream_id], &image_widths_[stream_id]));
+                        tokens_[stream_id], &image_widths_[stream_id],
+                        parallel_channels ? pool : nullptr));
     return true;
   };
-  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_streams, ThreadPool::NoInit,
-                                process_stream, "ComputeTokens"));
+  if (parallel_channels) {
+    for (size_t stream = 0; stream < num_streams; ++stream) {
+      JXL_RETURN_IF_ERROR(process_stream(stream, 0));
+    }
+  } else {
+    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_streams, ThreadPool::NoInit,
+                                  process_stream, "ComputeTokens"));
+  }
   return true;
 }
 
 Status ModularFrameEncoder::EncodeGlobalInfo(bool streaming_mode,
                                              BitWriter* writer,
-                                             AuxOut* aux_out) {
+                                             AuxOut* aux_out, ThreadPool* pool) {
   LosslessStageTimer timer(cparams_, frame_dim_, "entropy");
+  LosslessProfileScope profile(cparams_.options.histogram_params.lossless_profile,
+                               "modular.global_entropy");
   JxlMemoryManager* memory_manager = writer->memory_manager();
   bool skip_rest = false;
   JXL_RETURN_IF_ERROR(
@@ -1358,6 +1724,14 @@ Status ModularFrameEncoder::EncodeGlobalInfo(bool streaming_mode,
   params.streaming_mode = streaming_mode;
   params.add_missing_symbols = streaming_mode;
   params.image_widths = image_widths_;
+  params.lossless_bucket_matcher = cparams_.IsLossless() &&
+      cparams_.lossless_bucket_matcher && !CurrentFinalPlan();
+  const char* parallel_lz77 = std::getenv("JXL_LOSSLESS_LZ77_PARALLEL");
+  if (!streaming_mode && cparams_.modular_mode && cparams_.IsLossless() &&
+      !CurrentFinalPlan() && parallel_lz77 &&
+      std::strcmp(parallel_lz77, "1") == 0) {
+    params.lossless_lz77_pool = cparams_.lossless_probe_runner ? nullptr : pool;
+  }
   // Write histograms.
   JXL_ASSIGN_OR_RETURN(
       size_t cost, BuildAndEncodeHistograms(
@@ -1371,6 +1745,9 @@ Status ModularFrameEncoder::EncodeStream(BitWriter* writer, AuxOut* aux_out,
                                          LayerType layer,
                                          const ModularStreamId& stream) {
   size_t stream_id = stream.ID(frame_dim_);
+  LosslessProfileScope profile(cparams_.options.histogram_params.lossless_profile,
+                               "modular.stream");
+  profile.Set("stream", stream_id);
   if (stream_images_[stream_id].channel.empty()) {
     JXL_DEBUG_V(10, "Modular stream %" PRIuS " is empty.", stream_id);
     return true;  // Image with no channels, header never gets decoded.
@@ -1416,7 +1793,9 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
                                                 const CompressParams& cparams,
                                                 int minShift, int maxShift,
                                                 const ModularStreamId& stream,
-                                                bool do_color, bool groupwise) {
+                                                bool do_color, bool groupwise,
+                                                ThreadPool* wp_pool,
+                                                size_t* deferred_wp_modes) {
   size_t stream_id = stream.ID(frame_dim_);
   if (stream_id == 0 && frame_dim_.num_groups != 1) {
     // If we have multiple groups, then the stream with ID 0 holds the full
@@ -1429,6 +1808,7 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
   const size_t xsize = rect.xsize();
   const size_t ysize = rect.ysize();
   Image& gi = stream_images_[stream_id];
+  const size_t transform_start = stream_id == 0 ? gi.transform.size() : 0;
   if (stream_id > 0) {
     JXL_ASSIGN_OR_RETURN(gi, Image::Create(memory_manager, xsize, ysize,
                                            full_image.bitdepth, 0));
@@ -1466,7 +1846,7 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
     // Local palette transforms
     // TODO(veluca): make this work with quantize-after-prediction in lossy
     // mode.
-    if (cparams_.ModularPartIsLossless() && !cparams.responsive &&
+    if (!ReplayingFinalPlan() && cparams_.ModularPartIsLossless() && !cparams.responsive &&
         !cparams.lossy_palette && cparams.speed_tier < SpeedTier::kCheetah) {
       int max_bitdepth = 0, maxval = 0;  // don't care about that here
       float channel_color_percent = 0;
@@ -1478,11 +1858,15 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
 
   // lossless and no specific color transform specified: try Nothing, YCoCg,
   // and 17 RCTs
-  if (cparams.color_transform == ColorTransform::kNone &&
+  if (!ReplayingFinalPlan() && cparams.color_transform == ColorTransform::kNone &&
       cparams.IsLossless() && cparams.colorspace < 0 &&
       gi.channel.size() - gi.nb_meta_channels >= 3 &&
       cparams.responsive == JXL_FALSE && do_color &&
       cparams.speed_tier <= SpeedTier::kHare) {
+    if (auto* audit = cparams.options.histogram_params.direct_audit) {
+      ++audit->forbidden_searches;
+      return JXL_FAILURE("Direct plan reached RCT search");
+    }
     size_t nb_rcts_to_try = 0;
     switch (cparams.speed_tier) {
       case SpeedTier::kLightning:
@@ -1564,23 +1948,148 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
   } else {
     // No need to try anything, just use the default options.
   }
+  JXL_RETURN_IF_ERROR(FinalTransforms(gi, transform_start));
   size_t nb_wp_modes = 1;
-  if (cparams.speed_tier <= SpeedTier::kTortoise) {
+  if (cparams.direct_plan >= 0) {
+    stream_options_[stream_id].wp_mode = cparams.options.wp_mode;
+  } else if (cparams.speed_tier <= SpeedTier::kTortoise) {
     nb_wp_modes = 5;
   } else if (cparams.speed_tier <= SpeedTier::kKitten) {
     nb_wp_modes = 2;
   }
-  if (nb_wp_modes > 1 &&
+  if (!ReplayingFinalPlan() && nb_wp_modes > 1 &&
       PredictorHasWeighted(stream_options_[stream_id].predictor)) {
+    if (auto* audit = cparams.options.histogram_params.direct_audit) {
+      ++audit->forbidden_searches;
+      return JXL_FAILURE("Direct plan reached WP search");
+    }
+    if (deferred_wp_modes) {
+      *deferred_wp_modes = nb_wp_modes;
+      return true;
+    }
+    LosslessProfileScope wp_profile(
+        cparams.options.histogram_params.lossless_profile, "modular.wp_search");
+    wp_profile.Set("modes", nb_wp_modes);
+    wp_profile.Set("stream", stream_id);
     float best_cost = std::numeric_limits<float>::max();
     stream_options_[stream_id].wp_mode = 0;
+    const char* bound_value = std::getenv("JXL_LOSSLESS_WP_BOUND");
+    const bool bound_wp = cparams.options.lossless_tree_speedups &&
+        bound_value && std::strcmp(bound_value, "1") == 0;
+    WPCostWork work;
+    size_t pixels = 0;
+    for (const auto& ch : gi.channel) pixels += ch.w * ch.h;
+    const bool parallel_modes = wp_pool && pixels >= 65536;
+    std::array<float, 5> costs;
+    std::array<WPCostWork, 5> works;
+    if (parallel_modes) {
+      const auto evaluate = [&](uint32_t mode, size_t) -> Status {
+        costs[mode] = EstimateWPCost(
+            gi, mode, std::numeric_limits<float>::infinity(), &works[mode],
+            cparams.ModularPartIsLossless());
+        return true;
+      };
+      JXL_RETURN_IF_ERROR(RunOnPool(wp_pool, 0, nb_wp_modes, ThreadPool::NoInit,
+                                    evaluate, "LosslessWPModes"));
+      for (size_t i = 0; i < nb_wp_modes; ++i) {
+        work.pixels += works[i].pixels;
+        work.pruned_modes += works[i].pruned_modes;
+        work.checkpoints += works[i].checkpoints;
+      }
+    }
     for (size_t i = 0; i < nb_wp_modes; i++) {
-      float cost = EstimateWPCost(gi, i);
+      float cost = parallel_modes ? costs[i] : EstimateWPCost(
+          gi, i, bound_wp ? best_cost : std::numeric_limits<float>::infinity(), &work,
+          cparams.ModularPartIsLossless());
       if (cost < best_cost) {
         best_cost = cost;
         stream_options_[stream_id].wp_mode = i;
       }
     }
+    wp_profile.Set("bounded", bound_wp && !parallel_modes);
+    wp_profile.Set("parallel_modes", parallel_modes ? nb_wp_modes : 1);
+    wp_profile.Set("scanned_pixels", work.pixels);
+    wp_profile.Set("saved_pixels", pixels * nb_wp_modes - work.pixels);
+    wp_profile.Set("pruned_modes", work.pruned_modes);
+    wp_profile.Set("checkpoints", work.checkpoints);
+  }
+  if (CurrentFinalPlan()) {
+    std::vector<int64_t> mode{static_cast<int64_t>(stream_id), stream_options_[stream_id].wp_mode};
+    JXL_RETURN_IF_ERROR(FinalPlanExchange("wp", &mode));
+    JXL_ENSURE(mode.size() == 2 && mode[0] == stream_id && mode[1] >= 0 && mode[1] <= 4);
+    stream_options_[stream_id].wp_mode = mode[1];
+  }
+  return true;
+}
+
+Status ModularFrameEncoder::PrepareWPModes(const std::vector<size_t>& modes,
+                                          ThreadPool* pool) {
+  LosslessProfileScope profile(cparams_.options.histogram_params.lossless_profile,
+                               "modular.wp_wave");
+  const char* wp_parallel_env = std::getenv("JXL_LOSSLESS_WP_PARALLEL");
+  const bool split_channels = wp_parallel_env && std::strcmp(wp_parallel_env, "3") == 0;
+  struct Job { size_t stream, mode, pixels, channel; float cost = 0; };
+  std::vector<Job> jobs;
+  std::vector<std::array<float, 5>> costs(modes.size());
+  size_t max_width = 0;
+  for (size_t stream = 0; stream < modes.size(); ++stream) {
+    if (!modes[stream]) continue;
+    size_t pixels = 0;
+    for (const auto& ch : stream_images_[stream].channel) {
+      pixels += ch.w * ch.h;
+      max_width = std::max(max_width, ch.w);
+    }
+    for (size_t mode = 0; mode < modes[stream]; ++mode) {
+      if (split_channels) {
+        for (size_t c = 0; c < stream_images_[stream].channel.size(); ++c) {
+          const auto& ch = stream_images_[stream].channel[c];
+          jobs.push_back({stream, mode, ch.w * ch.h, c});
+        }
+      } else {
+        jobs.push_back({stream, mode, pixels, SIZE_MAX});
+      }
+    }
+  }
+  if (jobs.empty()) return true;
+  std::stable_sort(jobs.begin(), jobs.end(), [](const auto& a, const auto& b) {
+    return a.pixels > b.pixels;
+  });
+  const size_t tasks = LosslessWorkerLimits::FromEnvironment().Tasks(
+      jobs.size(), (1u << 20) + uint64_t{max_width} * 256);
+  std::atomic<size_t> next{0};
+  const auto evaluate = [&](uint32_t, size_t) -> Status {
+    for (;;) {
+      const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+      if (i >= jobs.size()) return true;
+      auto& job = jobs[i];
+      LosslessProfileScope mode(profile.Id(), "modular.wp_mode");
+      WPCostWork work;
+      job.cost = EstimateWPCost(stream_images_[job.stream],
+          job.mode, std::numeric_limits<float>::infinity(), &work, true, job.channel);
+      mode.Set("stream", job.stream);
+      mode.Set("mode", job.mode);
+      mode.Set("channel", job.channel == SIZE_MAX ? 0 : job.channel + 1);
+      mode.Set("scanned_pixels", work.pixels);
+    }
+  };
+  profile.Set("jobs", jobs.size());
+  profile.Set("worker_tasks", tasks);
+  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, tasks, ThreadPool::NoInit, evaluate,
+                                "LosslessWPWave"));
+  // Channels start with independent WP state. Reduce after joining, never
+  // atomically add floating costs in worker-completion order.
+  std::sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) {
+    return std::tie(a.stream, a.mode, a.channel) < std::tie(b.stream, b.mode, b.channel);
+  });
+  for (const auto& job : jobs) costs[job.stream][job.mode] += job.cost;
+  // All group/mode evaluations are independent; retain the original tie order.
+  for (size_t stream = 0; stream < modes.size(); ++stream) {
+    if (!modes[stream]) continue;
+    size_t best = 0;
+    for (size_t mode = 1; mode < modes[stream]; ++mode) {
+      if (costs[stream][mode] < costs[stream][best]) best = mode;
+    }
+    stream_options_[stream].wp_mode = best;
   }
   return true;
 }

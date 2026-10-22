@@ -18,11 +18,13 @@
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/common.h"
 #include "lib/jxl/dec_ans.h"
+#include "lib/jxl/enc_direct_audit.h"
 
 namespace jxl {
 
 // Forward declaration to break include cycle.
 struct CompressParams;
+class ThreadPool;
 
 // RebalanceHistogram requires a signed type.
 using ANSHistBin = int32_t;
@@ -65,6 +67,8 @@ struct HistogramParams {
     kFast,         // Only try some methods, early exit.
     kApproximate,  // Only try some methods.
     kPrecise,      // Try all methods.
+    kDirect0,      // One normalization, no flat/precision cost comparison.
+    kDirect6,
   };
 
   HistogramParams() = default;
@@ -91,6 +95,7 @@ struct HistogramParams {
       const std::vector<uint8_t>& extra_dc_precision, bool streaming_mode);
 
   HybridUintConfig UintConfig() const {
+    if (direct_audit && direct_explicit_uint) return direct_uint_config;
     if (uint_method == HistogramParams::HybridUintMethod::kContextMap) {
       return HybridUintConfig(2, 0, 1);
     }
@@ -107,6 +112,11 @@ struct HistogramParams {
   // For the optimal LZ77 methods: always use the slower, more careful greedy
   // first pass (otherwise only for small inputs).
   bool lz77_careful_first_pass = false;
+  // Exact optimal-parser cost reuse, enabled only for lossless Modular data.
+  bool lossless_lz77_cost_spans = false;
+  // Supplied only by the non-streaming global lossless stage, outside its pool.
+  ThreadPool* lossless_lz77_pool = nullptr;
+  bool lossless_bucket_matcher = false;
   ANSHistogramStrategy ans_histogram_strategy = ANSHistogramStrategy::kPrecise;
   std::vector<size_t> image_widths;
   size_t max_histograms = ~0;
@@ -115,6 +125,14 @@ struct HistogramParams {
   bool streaming_mode = false;
   bool add_missing_symbols = false;
   bool add_fixed_histograms = false;
+  // Diagnostic context only; never serialized or used to select encoding.
+  uint64_t lossless_profile = 0;
+  // Encoder-only policy eligibility: 0=off, 1=lossless pixels, 2=JPEG rebuild.
+  uint8_t tool_policy_domain = 0;
+  DirectAudit* direct_audit = nullptr;
+  size_t direct_clusters = 1;
+  bool direct_explicit_uint = false;
+  HybridUintConfig direct_uint_config;
 };
 
 struct Histogram {

@@ -5,6 +5,7 @@
 
 #include <jxl/memory_manager.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -156,6 +157,42 @@ TEST(IccCodecTest, Icc) {
     for (size_t i = 0; i <= 256; i++) {
       profile.push_back(kTestProfile[i]);
       TestProfile(profile);
+    }
+  }
+}
+
+TEST(IccCodecTest, LosslessSearchPreservesProfileAndBitAlignment) {
+  auto* memory = test::MemoryManager();
+  for (size_t size : {size_t{1}, size_t{128}, sizeof(kTestProfile), size_t{17000}}) {
+    IccBytes profile(size);
+    for (size_t i = 0; i < size; ++i) {
+      profile[i] = kTestProfile[i % sizeof(kTestProfile)];
+    }
+    for (size_t prefix = 0; prefix < 8; ++prefix) {
+      SCOPED_TRACE(size);
+      SCOPED_TRACE(prefix);
+      BitWriter original(memory);
+      BitWriter searched(memory);
+      for (BitWriter* writer : {&original, &searched}) {
+        ASSERT_TRUE(writer->WithMaxBits(8, LayerType::Header, nullptr, [&] {
+          writer->Write(prefix, 0);
+          return true;
+        }));
+      }
+      ASSERT_TRUE(WriteICC(Span<const uint8_t>(profile), &original,
+                           LayerType::Header, nullptr));
+      AuxOut stats;
+      ASSERT_TRUE(WriteICC(Span<const uint8_t>(profile), &searched,
+                           LayerType::Header, &stats, true));
+      EXPECT_LE(searched.BitsWritten(), original.BitsWritten());
+      searched.ZeroPadToByte();
+      BitReader reader(searched.GetSpan());
+      EXPECT_EQ(reader.ReadBits(prefix), 0u);
+      std::vector<uint8_t> decoded;
+      ASSERT_TRUE(test::ReadICC(&reader, &decoded));
+      ASSERT_TRUE(reader.Close());
+      ASSERT_EQ(decoded.size(), profile.size());
+      EXPECT_TRUE(std::equal(decoded.begin(), decoded.end(), profile.begin()));
     }
   }
 }

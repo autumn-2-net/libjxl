@@ -4,6 +4,7 @@
 // license that can be found in the LICENSE file.
 
 #include "lib/jxl/modular/transform/enc_palette.h"
+#include "lib/jxl/modular/transform/enc_palette_order.h"
 
 #include <jxl/memory_manager.h>
 
@@ -13,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <set>
@@ -27,6 +29,8 @@
 #include "lib/jxl/modular/modular_image.h"
 #include "lib/jxl/modular/options.h"
 #include "lib/jxl/modular/transform/enc_transform.h"
+#include "lib/jxl/modular/transform/enc_palette_map.h"
+#include "lib/jxl/modular/transform/enc_palette_delta.h"
 #include "lib/jxl/modular/transform/palette.h"
 #include "lib/jxl/modular/transform/transform.h"
 
@@ -178,7 +182,8 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
                            uint32_t &nb_colors, uint32_t &nb_deltas,
                            bool ordered, bool lossy, Predictor &predictor,
                            const weighted::Header &wp_header,
-                           PaletteIterationData &palette_iteration_data) {
+                           PaletteIterationData &palette_iteration_data,
+                           bool lossless_encoder_tools) {
   JXL_QUIET_RETURN_IF_ERROR(CheckEqualChannels(input, begin_c, end_c));
   JXL_ENSURE(begin_c >= input.nb_meta_channels);
   JxlMemoryManager *memory_manager = input.memory_manager();
@@ -299,6 +304,10 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
   std::vector<float> color_with_error(nb);
   std::vector<const pixel_type *> p_in(nb);
   std::map<std::vector<pixel_type>, size_t> inv_palette;
+  const char* map_env = std::getenv("JXL_LOSSLESS_PALETTE_MAP");
+  const bool flat_map = lossless_encoder_tools && !lossy && nb <= 4 && map_env &&
+      std::strcmp(map_env, "1") == 0;
+  LosslessPaletteMap colors(std::min<uint32_t>(nb, 4));
 
   if (lossy) {
     palette_iteration_data.FindFrequentColorDeltas(w * h, input.bitdepth);
@@ -347,12 +356,15 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
       color[i] = palette_internal::GetPaletteValue(nullptr, k, i, 0, 0,
                                                    input.bitdepth);
     }
-    implicit_color[color] = true;
+    if (flat_map) colors.Get(color).implicit = true;
+    else implicit_color[color] = true;
     implicit_colors.push_back(color);
   }
 
   std::map<std::vector<pixel_type>, size_t> color_freq_map;
   uint32_t implicit_colors_used = 0;
+  std::vector<pixel_type> last_color;
+  LosslessPaletteMap::Entry* last_entry = nullptr;
   for (size_t y = 0; y < h; y++) {
     for (uint32_t c = 0; c < nb; c++) {
       p_in[c] = input.channel[begin_c + c].Row(y);
@@ -362,9 +374,18 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
       for (uint32_t c = 0; c < nb; c++) {
         color[c] = p_in[c][x];
       }
-      const bool new_color = candidate_palette.insert(color).second;
+      LosslessPaletteMap::Entry* entry = nullptr;
+      if (flat_map) {
+        if (!last_entry || color != last_color) {
+          last_color = color;
+          last_entry = &colors.Get(color);
+        }
+        entry = last_entry;
+      }
+      const bool new_color = flat_map ? !entry->seen : candidate_palette.insert(color).second;
+      if (flat_map) entry->seen = true;
       if (new_color) {
-        if (implicit_color[color]) {
+        if (flat_map ? entry->implicit : implicit_color[color]) {
           implicit_colors_used++;
         } else {
           candidate_palette_imageorder.push_back(color);
@@ -373,11 +394,15 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
           }
         }
       }
-      color_freq_map[color] += 1;
+      if (flat_map) ++entry->count;
+      else color_freq_map[color] += 1;
     }
   }
 
   nb_colors = nb_deltas + candidate_palette_imageorder.size();
+  const auto frequency = [&](const std::vector<pixel_type>& key) {
+    return flat_map ? colors.Get(key).count : color_freq_map[key];
+  };
 
   // not useful to make a single-color palette
   if (!lossy && nb_colors + implicit_colors_used == 1) return false;
@@ -387,14 +412,15 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
   for (size_t k = 0; k < palette_internal::kImplicitPaletteSize; k++) {
     color = implicit_colors[k];
     // still add the color to the explicit palette if it is frequent enough
-    if (color_freq_map[color] > 10) {
+    if (frequency(color) > 10) {
       nb_colors++;
       candidate_palette_imageorder.push_back(color);
     }
   }
   for (size_t k = 0; k < palette_internal::kImplicitPaletteSize; k++) {
     color = implicit_colors[k];
-    inv_palette[color] = nb_colors + k;
+    if (flat_map) colors.Get(color).index = nb_colors + k;
+    else inv_palette[color] = nb_colors + k;
   }
 
   JXL_DEBUG_V(6, "Channels %i-%i can be represented using a %i-color palette.",
@@ -422,12 +448,117 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
   // Within each bucket, the colors are sorted on luma (times alpha).
   float freq_threshold = 4;  // arbitrary threshold
   int clr = 0;
-  if (ordered && nb >= 3) {
+  const char* order_env = std::getenv("JXL_LOSSLESS_PALETTE_ORDER");
+  const int frequency_order = lossless_encoder_tools && !lossy && order_env &&
+      order_env[0] >= '1' && order_env[0] <= '9' && order_env[1] == '\0'
+      ? order_env[0] - '0' : 0;
+  const char* geometry_env = std::getenv("JXL_LOSSLESS_PALETTE_GEOMETRY");
+  const bool principal = lossless_encoder_tools && !lossy && geometry_env &&
+      (std::strcmp(geometry_env, "1") == 0 || std::strcmp(geometry_env, "2") == 0);
+  if (ordered && nb >= 3 && nb <= 4 && principal) {
+    std::vector<std::array<int32_t, 4>> tuples(candidate_palette_imageorder.size());
+    std::vector<size_t> frequencies(tuples.size());
+    for (size_t i = 0; i < tuples.size(); ++i) {
+      const auto& pcol = candidate_palette_imageorder[i];
+      std::copy(pcol.begin(), pcol.end(), tuples[i].begin());
+      frequencies[i] = frequency(pcol);
+    }
+    const auto order = PalettePrincipalOrder(tuples, frequencies, nb, geometry_env[0] == '2');
+    std::vector<std::vector<pixel_type>> reordered;
+    reordered.reserve(order.size());
+    for (size_t i : order) reordered.push_back(std::move(candidate_palette_imageorder[i]));
+    candidate_palette_imageorder = std::move(reordered);
+  } else if (ordered && nb >= 3 && nb <= 4 && frequency_order >= 8) {
+    const size_t count = candidate_palette_imageorder.size();
+    std::vector<size_t> frequencies(count), bands(count);
+    for (size_t i = 0; i < count; ++i) {
+      const auto& pcol = candidate_palette_imageorder[i];
+      frequencies[i] = frequency(pcol);
+      bands[i] = FloorLog2Nonzero(std::max<size_t>(1, frequencies[i])) / 2;
+      if (flat_map) colors.Get(pcol).index = i;
+      else inv_palette[pcol] = i;
+    }
+    const size_t step = std::max<size_t>(1, (w * h + 262143) / 262144);
+    std::vector<uint64_t> pairs;
+    const auto index = [&](size_t x, size_t y) -> size_t {
+      for (size_t c = 0; c < nb; ++c) color[c] = input.channel[begin_c + c].Row(y)[x];
+      return flat_map ? colors.Get(color).index : inv_palette[color];
+    };
+    const auto add = [&](size_t a, size_t b) {
+      if (a >= count || b >= count || a == b) return;
+      if (frequency_order == 9 && bands[a] != bands[b]) return;
+      if (a > b) std::swap(a, b);
+      pairs.push_back((uint64_t{a} << 32) | b);
+    };
+    for (size_t pos = 0; pos < w * h; pos += step) {
+      const size_t x = pos % w, y = pos / w, current = index(x, y);
+      if (x + 1 < w) add(current, index(x + 1, y));
+      if (y + 1 < h) add(current, index(x, y + 1));
+    }
+    const auto order = PaletteAdjacencyOrder(frequencies, std::move(pairs));
+    JXL_ENSURE(order.size() == count);
+    std::vector<std::vector<pixel_type>> ordered_colors;
+    ordered_colors.reserve(count);
+    for (size_t i : order) ordered_colors.push_back(std::move(candidate_palette_imageorder[i]));
+    candidate_palette_imageorder = std::move(ordered_colors);
+  } else if (ordered && nb >= 3 && nb <= 4 && frequency_order >= 6) {
+    struct PaletteKey {
+      std::array<uint32_t, 4> curve;
+      size_t band, index;
+    };
+    std::vector<PaletteKey> keys;
+    keys.reserve(candidate_palette_imageorder.size());
+    for (size_t i = 0; i < candidate_palette_imageorder.size(); ++i) {
+      const auto& pcol = candidate_palette_imageorder[i];
+      std::array<uint32_t, 4> axes{};
+      for (size_t c = 0; c < nb; ++c) axes[c] = uint32_t(pcol[c]) ^ 0x80000000u;
+      keys.push_back({PaletteHilbertKey(axes, nb, 32),
+          frequency_order == 6 ? FloorLog2Nonzero(std::max<size_t>(1, frequency(pcol))) / 2 : 0,
+          i});
+    }
+    std::sort(keys.begin(), keys.end(), [nb](const auto& a, const auto& b) {
+      if (a.band != b.band) return a.band > b.band;
+      return PaletteInterleavedLess(a.curve, b.curve, nb);
+    });
+    std::vector<std::vector<pixel_type>> ordered_colors;
+    ordered_colors.reserve(keys.size());
+    for (const auto& key : keys)
+      ordered_colors.push_back(std::move(candidate_palette_imageorder[key.index]));
+    candidate_palette_imageorder = std::move(ordered_colors);
+  } else if (ordered && nb >= 3) {
     JXL_DEBUG_V(7, "Palette of %i colors, using luma order", nb_colors);
     // sort on luma (multiplied by alpha if available)
     std::sort(candidate_palette_imageorder.begin(),
               candidate_palette_imageorder.end(),
-              [&](std::vector<pixel_type> ap, std::vector<pixel_type> bp) {
+              [&](const std::vector<pixel_type>& ap, const std::vector<pixel_type>& bp) {
+                if (frequency_order) {
+                  const size_t af = frequency(ap), bf = frequency(bp);
+                  if (frequency_order == 1 && af != bf) return af > bf;
+                  if (frequency_order == 2 || frequency_order == 3) {
+                    const auto ab = FloorLog2Nonzero(std::max<size_t>(1, af)) / 2;
+                    const auto bb = FloorLog2Nonzero(std::max<size_t>(1, bf)) / 2;
+                    if (ab != bb) return ab > bb;
+                  }
+                  if (frequency_order == 4 && (af > 4) != (bf > 4))
+                    return af > 4;
+                  if (frequency_order >= 3) {
+                    // Compare an interleaved signed-color Morton key without
+                    // truncating channels or materializing a 128-bit key.
+                    int highest_bit = -1;
+                    size_t channel = 0;
+                    for (size_t c = 0; c < ap.size(); ++c) {
+                      const uint32_t delta = uint32_t(ap[c]) ^ uint32_t(bp[c]);
+                      if (delta != 0) {
+                        const int bit = FloorLog2Nonzero(delta);
+                        if (bit > highest_bit) {
+                          highest_bit = bit;
+                          channel = c;
+                        }
+                      }
+                    }
+                    return highest_bit >= 0 && ap[channel] < bp[channel];
+                  }
+                }
                 float ay;
                 float by;
                 ay = (0.299f * ap[0] + 0.587f * ap[1] + 0.114f * ap[2] + 0.1f);
@@ -436,8 +567,8 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
                 if (bp.size() > 3) by *= 1.f + bp[3];
                 // put common colors first, transparent dark to opaque bright,
                 // then rare colors, bright to dark
-                ay = color_freq_map[ap] > freq_threshold ? -ay : ay;
-                by = color_freq_map[bp] > freq_threshold ? -by : by;
+                ay = frequency(ap) > freq_threshold ? -ay : ay;
+                by = frequency(bp) > freq_threshold ? -by : by;
                 return ay < by;
               });
   } else {
@@ -450,7 +581,8 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
       p_palette[nb_deltas + i * onerow + clr] = pcol[i];
       JXL_DEBUG_V(9, "%i ", pcol[i]);
     }
-    inv_palette[pcol] = clr;
+    if (flat_map) colors.Get(pcol).index = clr;
+    else inv_palette[pcol] = clr;
     clr++;
   }
   std::vector<weighted::State> wp_states;
@@ -470,6 +602,8 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
       }
     }
   }
+  last_color.clear();
+  size_t last_index = 0;
   for (size_t y = 0; y < h; y++) {
     for (size_t c = 0; c < nb; c++) {
       p_in[c] = input.channel[begin_c + c].Row(y);
@@ -480,7 +614,13 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
       int index;
       if (!lossy) {
         for (size_t c = 0; c < nb; c++) color[c] = p_in[c][x];
-        index = inv_palette[color];
+        if (flat_map) {
+          if (color != last_color) {
+            last_index = colors.Get(color).index;
+            last_color = color;
+          }
+          index = last_index;
+        } else index = inv_palette[color];
       } else {
         int best_index = 0;
         bool best_is_delta = false;
@@ -647,7 +787,27 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
 Status FwdPalette(Image &input, uint32_t begin_c, uint32_t end_c,
                   uint32_t &nb_colors, uint32_t &nb_deltas, bool ordered,
                   bool lossy, Predictor &predictor,
-                  const weighted::Header &wp_header) {
+                  const weighted::Header &wp_header,
+                  bool lossless_encoder_tools) {
+  const char* delta_env = std::getenv("JXL_LOSSLESS_DELTA_PALETTE");
+  Predictor zero_predictor = Predictor::Zero;
+  std::vector<uint8_t> zero_mask;
+  if (lossless_encoder_tools && !lossy && delta_env &&
+      delta_env[0] >= '4' && delta_env[0] <= '6' &&
+      delta_env[1] == '\0') {
+    zero_predictor = delta_env[0] == '4' ? Predictor::Gradient
+        : delta_env[0] == '5' ? Predictor::Left : Predictor::Top;
+    zero_mask = ExactZeroDeltaMask(input, begin_c, end_c, zero_predictor);
+  }
+  if (lossless_encoder_tools && !lossy && delta_env &&
+      delta_env[0] >= '1' && delta_env[0] <= '3' &&
+      delta_env[1] == '\0') {
+    const Predictor p = delta_env[0] == '1' ? Predictor::Gradient
+        : delta_env[0] == '2' ? Predictor::Left : Predictor::Top;
+    JXL_ASSIGN_OR_RETURN(bool applied, FwdExactDeltaPalette(input, begin_c,
+        end_c, &nb_colors, &nb_deltas, &predictor, p));
+    if (applied) return true;
+  }
   PaletteIterationData palette_iteration_data;
   uint32_t nb_colors_orig = nb_colors;
   uint32_t nb_deltas_orig = nb_deltas;
@@ -655,12 +815,17 @@ Status FwdPalette(Image &input, uint32_t begin_c, uint32_t end_c,
   if (lossy && input.bitdepth >= 8) {
     JXL_RETURN_IF_ERROR(FwdPaletteIteration(
         input, begin_c, end_c, nb_colors_orig, nb_deltas_orig, ordered, lossy,
-        predictor, wp_header, palette_iteration_data));
+        predictor, wp_header, palette_iteration_data, lossless_encoder_tools));
   }
   palette_iteration_data.final_run = true;
-  return FwdPaletteIteration(input, begin_c, end_c, nb_colors, nb_deltas,
+  JXL_RETURN_IF_ERROR(FwdPaletteIteration(input, begin_c, end_c, nb_colors, nb_deltas,
                              ordered, lossy, predictor, wp_header,
-                             palette_iteration_data);
+                             palette_iteration_data, lossless_encoder_tools));
+  if (!zero_mask.empty()) {
+    JXL_RETURN_IF_ERROR(AddExactZeroDelta(input, begin_c, &nb_deltas,
+                                           &predictor, zero_predictor, zero_mask));
+  }
+  return true;
 }
 
 }  // namespace jxl

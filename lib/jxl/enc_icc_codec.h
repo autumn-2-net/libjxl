@@ -23,7 +23,8 @@ class PaddedBytes;
 
 // Should still be called if `icc.empty()` - if so, writes only 1 bit.
 Status WriteICC(Span<const uint8_t> icc, BitWriter* JXL_RESTRICT writer,
-                LayerType layer, AuxOut* JXL_RESTRICT aux_out);
+                LayerType layer, AuxOut* JXL_RESTRICT aux_out,
+                bool lossless_search = false);
 
 }  // namespace jxl
 

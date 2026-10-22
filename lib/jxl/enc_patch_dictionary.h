@@ -35,10 +35,10 @@ constexpr size_t kMaxPatchSize = 32;
 struct QuantizedPatch {
   size_t xsize;
   size_t ysize;
-  QuantizedPatch() {
+  explicit QuantizedPatch(size_t storage_pixels = kMaxPatchSize * kMaxPatchSize) {
     for (size_t i = 0; i < 3; i++) {
-      pixels[i].resize(kMaxPatchSize * kMaxPatchSize);
-      fpixels[i].resize(kMaxPatchSize * kMaxPatchSize);
+      pixels[i].resize(storage_pixels);
+      fpixels[i].resize(storage_pixels);
     }
   }
   std::vector<int8_t> pixels[3] = {};

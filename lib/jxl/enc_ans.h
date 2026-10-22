@@ -94,6 +94,7 @@ struct SizeWriter {
 };
 
 struct EntropyEncodingData {
+  uint64_t lossless_profile = 0;
   std::vector<std::vector<ANSEncSymbolInfo>> encoding_info;
   bool use_prefix_code;
   std::vector<HybridUintConfig> uint_config;
@@ -111,7 +112,7 @@ struct EntropyEncodingData {
   StatusOr<size_t> BuildAndStoreANSEncodingData(
       JxlMemoryManager* memory_manager,
       HistogramParams::ANSHistogramStrategy ans_histogram_strategy,
-      const Histogram& histogram, BitWriter* writer);
+      const Histogram& histogram, BitWriter* writer, DirectAudit* audit = nullptr);
 
  private:
   Status ChooseUintConfigs(JxlMemoryManager* memory_manager,

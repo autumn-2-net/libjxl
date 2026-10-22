@@ -9,8 +9,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <map>
+#include <memory>
 #include <vector>
 
 #include "lib/jxl/base/compiler_specific.h"
@@ -453,7 +456,8 @@ Status PredictICC(const uint8_t* icc, size_t size, PaddedBytes* result) {
 }
 
 Status WriteICC(const Span<const uint8_t> icc, BitWriter* JXL_RESTRICT writer,
-                LayerType layer, AuxOut* JXL_RESTRICT aux_out) {
+                LayerType layer, AuxOut* JXL_RESTRICT aux_out,
+                bool lossless_search) {
   if (icc.empty()) return JXL_FAILURE("ICC must be non-empty");
   JxlMemoryManager* memory_manager = writer->memory_manager();
   PaddedBytes enc{memory_manager};
@@ -471,8 +475,40 @@ Status WriteICC(const Span<const uint8_t> icc, BitWriter* JXL_RESTRICT writer,
   HistogramParams params;
   params.lz77_method = enc.size() < 16384 ? HistogramParams::LZ77Method::kOptc256
                                          : HistogramParams::LZ77Method::kLZ77b3w3t;
-  EntropyEncodingData code;
   params.force_huffman = true;
+  if (lossless_search && enc.size() < 16384) {
+    // ICC tokens are small and independent of the image route. Select actual
+    // encoded bits, retaining the original parser as a no-growth fallback.
+    std::unique_ptr<BitWriter> best;
+    AuxOut best_stats;
+    for (size_t choice = 0; choice < 4; ++choice) {
+      auto trial = std::make_unique<BitWriter>(memory_manager);
+      auto trial_tokens = tokens;
+      auto trial_params = params;
+      if (choice & 1) trial_params.clustering = HistogramParams::ClusteringType::kFast;
+      if (choice & 2) trial_params.uint_method = HistogramParams::HybridUintMethod::k000;
+      EntropyEncodingData code;
+      AuxOut stats;
+      JXL_ASSIGN_OR_RETURN(size_t cost, BuildAndEncodeHistograms(
+          memory_manager, trial_params, kNumICCContexts, trial_tokens,
+          &code, trial.get(), layer, aux_out ? &stats : nullptr));
+      (void)cost;
+      JXL_RETURN_IF_ERROR(WriteTokens(trial_tokens[0], code, 0, trial.get(),
+                                      layer, aux_out ? &stats : nullptr));
+      if (std::getenv("JXL_LOSSLESS_ICC_TRACE")) {
+        std::fprintf(stderr, "icc-trial choice=%zu tokens=%zu bits=%zu\n",
+                     choice, enc.size(), trial->BitsWritten());
+      }
+      if (!best || trial->BitsWritten() < best->BitsWritten()) {
+        best = std::move(trial);
+        best_stats = stats;
+      }
+    }
+    JXL_RETURN_IF_ERROR(writer->AppendUnaligned(*best));
+    if (aux_out) aux_out->Assimilate(best_stats);
+    return true;
+  }
+  EntropyEncodingData code;
   JXL_ASSIGN_OR_RETURN(size_t cost, BuildAndEncodeHistograms(
                                         memory_manager, params, kNumICCContexts,
                                         tokens, &code, writer, layer, aux_out));

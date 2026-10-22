@@ -26,6 +26,7 @@
 namespace jxl {
 
 class LosslessTrialBudget;
+class ThreadPool;
 
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 struct CompressParams {
@@ -135,6 +136,15 @@ struct CompressParams {
 
   // Only set by the cumulative search for disposable, non-baseline trials.
   LosslessTrialBudget* lossless_trial_budget = nullptr;
+  // Borrowed only by serially scheduled preflight samples. Never serialized.
+  ThreadPool* lossless_probe_runner = nullptr;
+  // Encoder-only implementation choice for a nominated lossless candidate.
+  bool lossless_bucket_matcher = false;
+  // Independent entropy effort for an encoder-only hybrid lossless candidate.
+  bool lossless_precise_entropy = false;
+  // Disposable preflight only: 1=greedy, 2=short-chain optimal LZ77.
+  uint8_t lossless_probe_lz77 = 0;
+  bool lossless_disposable_probe = false;
 
   // Returns whether these params are lossless as defined by SetLossless();
   bool IsLossless() const { return modular_mode && ModularPartIsLossless(); }
@@ -199,6 +209,9 @@ struct CompressParams {
   // first pass, instead of only for small inputs. Helps small files with large
   // token streams, such as jxl_from_tree art. Used in jxl_from_tree tool.
   bool lz77_careful_first_pass = false;
+  uint8_t lossless_tool_domain = 0;
+  // Internal experimental direct plan. Not a public encoder parameter.
+  int direct_plan = -1;
   // If not empty, these custom splines will be used instead of the computed
   // ones. Used in jxl_from_tee tool.
   SplineDataView custom_splines{};

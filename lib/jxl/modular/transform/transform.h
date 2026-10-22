@@ -56,6 +56,7 @@ class Transform : public Fields {
   // for Palette, not serialized.
   bool ordered_palette = true;
   bool lossy_palette = false;
+  bool lossless_encoder_tools = false;  // Encoder-only, not serialized.
 
   explicit Transform(TransformId id);
   // default constructor for bundles.

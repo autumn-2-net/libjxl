@@ -300,6 +300,7 @@ set(JPEGXL_INTERNAL_ENC_SOURCES
   jxl/enc_ans_params.h
   jxl/enc_ans_simd.cc
   jxl/enc_ans_simd.h
+  jxl/enc_uint_histogram.h
   jxl/enc_aux_out.cc
   jxl/enc_aux_out.h
   jxl/enc_bit_writer.cc
@@ -354,10 +355,38 @@ set(JPEGXL_INTERNAL_ENC_SOURCES
   jxl/enc_linalg.h
   jxl/enc_lossless_probe.cc
   jxl/enc_lossless_probe.h
+  jxl/enc_lossless_racing.h
+  jxl/enc_lossless_workers.h
+  jxl/enc_lossless_scan.cc
+  jxl/enc_lossless_scan.h
+  jxl/enc_lossless_profile.h
   jxl/enc_lossless_search.cc
   jxl/enc_lossless_search.h
+  jxl/enc_tool_policy.cc
+  jxl/enc_tool_policy.h
+  jxl/enc_direct_audit.h
+  jxl/enc_direct_plan.h
+  jxl/enc_direct_plan.cc
+  jxl/enc_neural_plan.h
+  jxl/enc_neural_plan.cc
+  jxl/enc_final_plan.h
+  jxl/enc_final_plan.cc
+  jxl/enc_ma_search.h
+  jxl/enc_ma_search.cc
+  jxl/enc_ma_tree_groups.h
   jxl/enc_lz77.cc
   jxl/enc_lz77.h
+  jxl/enc_lz77_cost.h
+  jxl/enc_lz77_bucket.cc
+  jxl/enc_lz77_bucket.h
+  jxl/enc_lz77_deep.h
+  jxl/enc_lz77_parse.h
+  jxl/enc_lz77_index.h
+  jxl/enc_lz77_lcp.h
+  jxl/enc_lz77_suffix.cc
+  jxl/enc_lz77_suffix.h
+  jxl/enc_lz77_block.h
+  jxl/enc_cluster_bound.h
   jxl/enc_modular.cc
   jxl/enc_modular.h
   jxl/enc_modular_simd.cc
@@ -397,8 +426,15 @@ set(JPEGXL_INTERNAL_ENC_SOURCES
   jxl/modular/encoding/enc_encoding.h
   jxl/modular/encoding/enc_ma.cc
   jxl/modular/encoding/enc_ma.h
+  jxl/modular/encoding/enc_ma_entropy.h
+  jxl/modular/encoding/enc_ma_histograms.h
+  jxl/modular/encoding/enc_ma_racing.h
+  jxl/modular/encoding/enc_predict.h
   jxl/modular/transform/enc_palette.cc
   jxl/modular/transform/enc_palette.h
+  jxl/modular/transform/enc_palette_map.h
+  jxl/modular/transform/enc_palette_order.h
+  jxl/modular/transform/enc_palette_delta.h
   jxl/modular/transform/enc_rct.cc
   jxl/modular/transform/enc_rct.h
   jxl/modular/transform/enc_squeeze.cc
